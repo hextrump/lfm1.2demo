@@ -1,0 +1,32 @@
+# ─── Model & binaries (download separately) ───
+*.gguf
+llama-server
+llama-cli
+libggml*.so*
+libllama*.so*
+libmtmd*.so*
+ggml-*.txt
+
+# ─── Python ───
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# ─── Runtime data ───
+data/ledger_db.json
+
+# ─── Frontend ───
+app/frontend/node_modules/
+app/frontend/dist/
+app/frontend/.vite/
+
+# ─── IDE / OS ───
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+opencode.json

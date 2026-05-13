@@ -1,0 +1,36 @@
+{
+  "ledger_id": "LDG-YYYYMMDD-XXXX",
+  "entry_date": "YYYY-MM-DD",
+  "status": "受付済/差戻/審査中",
+  "fields": {
+    "applicant_name": "",
+    "applicant_dept": "",
+    "application_type": "",
+    "application_date": "",
+    "application_summary": "",
+    "related_systems": [],
+    "priority_level": "",
+    "estimated_cost": ""
+  },
+  "deficiency": {
+    "deficiency_found": false,
+    "deficiency_items": [],
+    "missing_documents": [],
+    "completeness_score": 0
+  },
+  "risk": {
+    "risk_level": "",
+    "risk_factors": [],
+    "requires_manual_review": false,
+    "approval_chain": []
+  },
+  "decision": {
+    "decision": "",
+    "reason": "",
+    "conditions": [],
+    "next_action": "",
+    "assign_to": ""
+  },
+  "audit_log": "",
+  "confidence_score": 0
+}

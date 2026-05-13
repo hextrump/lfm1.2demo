@@ -1,0 +1,15 @@
+[project]
+name = "lfm-application-reception"
+version = "0.1.0"
+description = "ローカルAI申請受付支援 Demo — Local AI Application Reception Assistant"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
