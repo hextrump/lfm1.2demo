@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Pi agent state
+.pi-agent/sessions/
+.pi-agent/auth.json
+.pi/models.json
+.pi/settings.json
+
+# Training outputs
+training_data/lora_*/
+training_data/*.gguf
+
+# Runtime state
+erp_state/*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+image.png

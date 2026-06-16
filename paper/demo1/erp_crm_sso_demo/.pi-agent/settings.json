@@ -1,0 +1,10 @@
+{
+  "defaultProvider": "local-lfm",
+  "defaultModel": "lfm2.5-1.2b-instruct-q4_k_m.gguf",
+  "defaultThinkingLevel": "off",
+  "quietStartup": true,
+  "defaultProjectTrust": "always",
+  "enableInstallTelemetry": false,
+  "enableAnalytics": false,
+  "compaction": { "enabled": false }
+}
