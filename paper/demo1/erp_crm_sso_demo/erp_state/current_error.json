@@ -1,0 +1,18 @@
+{
+  "active": true,
+  "scenario_key": "VENDOR_MFA_EXCEPTION",
+  "system": "Integration Account",
+  "title": "High-risk MFA exception request",
+  "error_text": "Vendor requested a privileged integration account without MFA or Conditional Access.",
+  "error_code": "VENDOR_MFA_EXCEPTION",
+  "symptom": "vendor_mfa_exception",
+  "category": "Security Exception / Vendor Access",
+  "risk": "High",
+  "priority": "P2",
+  "route": "Security Team + IAM Approval Board",
+  "impact": "privileged_account",
+  "trace_id": "trc-vendor_mfa_exception-test",
+  "correlation_id": "corr-test-20260617",
+  "timestamp": "2026-06-17 03:10:00 JST",
+  "user_email": "test.user@demo.local"
+}
