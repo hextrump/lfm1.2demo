@@ -1,0 +1,19 @@
+{
+  "name": "erp_crm_sso_demo",
+  "version": "1.0.0",
+  "description": "ERP / CRM / SSO Agent P demo — local LFM 2.5 1.2B Instruct + Pi runtime + simulated ERP tools",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "serve": "bash scripts/start_lfm25_server.sh",
+    "test": "python3 tests/test_eval_with_mock.py"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.4",
+    "@earendil-works/pi-ai": "^0.79.4"
+  }
+}
