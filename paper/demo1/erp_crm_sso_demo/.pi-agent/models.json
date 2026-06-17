@@ -1,9 +1,9 @@
 {
   "providers": {
     "local-lfm": {
-      "baseUrl": "http://127.0.0.1:8080/v1",
+      "baseUrl": "http://127.0.0.1:7878/v1",
       "api": "openai-completions",
-      "apiKey": "local",
+      "apiKey": "lm-studio",
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
@@ -12,7 +12,7 @@
       },
       "models": [
         {
-          "id": "lfm2.5-1.2b-instruct-q4_k_m.gguf",
+          "id": "lfm2.5-1.2b-instruct",
           "name": "Local LFM2.5 1.2B Instruct",
           "reasoning": false,
           "input": ["text"],

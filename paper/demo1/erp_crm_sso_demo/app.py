@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -13,13 +14,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from agent_q import PiAgentRuntime
+from runtime import PiAgentRuntime
 
 APP_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = APP_DIR / "knowledge"
 ERP_STATE_DIR = APP_DIR / "erp_state"
 CURRENT_ERROR_PATH = ERP_STATE_DIR / "current_error.json"
-LLAMA_SERVER_URL = "http://127.0.0.1:8080"
+LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:7878")
 
 st.set_page_config(
     page_title="Internal ERP Portal",

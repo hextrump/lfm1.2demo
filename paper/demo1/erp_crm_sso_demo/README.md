@@ -54,11 +54,11 @@ Streamlit (app.py)
   - sends user chat to Pi Agent P via JSON mode
         |
         v
-Pi Agent P (agent_q/pi_agent.py)
+Pi Agent P (runtime/pi_agent.py)
   - local-lfm provider (llama.cpp)
   - LFM2.5-1.2B-Instruct
   - skill: .pi/skills/erp-support/SKILL.md
-  - extension: agent_q/pi_erp_extension.ts
+  - extension: runtime/pi_erp_extension.ts
         |
         v
 ERP / MCP-like tools (TypeScript)
@@ -153,7 +153,7 @@ erp_crm_sso_demo/
 ├── requirements-train.txt
 ├── package.json
 ├── app.py                              Streamlit UI
-├── agent_q/
+├── runtime/
 │   ├── __init__.py
 │   └── pi_agent.py                     Pi-first runtime
 ├── .pi/
@@ -181,7 +181,7 @@ erp_crm_sso_demo/
 │   ├── README.md
 │   ├── agent_p_sft.jsonl               (small seed, see README)
 │   └── agent_p_dpo.jsonl               (small seed, see README)
-└── agent_q/pi_erp_extension.ts         ERP / MCP-like tools
+└── runtime/pi_erp_extension.ts         ERP / MCP-like tools
 ```
 
 ## Prerequisites

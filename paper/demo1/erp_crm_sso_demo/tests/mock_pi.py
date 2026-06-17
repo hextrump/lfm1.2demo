@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_q import PiAgentRuntime  # noqa: E402
-from agent_q.pi_agent import (  # noqa: E402
+from runtime import PiAgentRuntime  # noqa: E402
+from runtime.pi_agent import (  # noqa: E402
     PiAgentEvent,
     PiAgentResult,
     ERP_INTENT_PATTERNS,
@@ -142,9 +142,9 @@ class MockPi:
 
 
 def patch_subprocess(mock: MockPi) -> None:
-    """Monkey-patch subprocess.run in the agent_q.pi_agent module."""
+    """Monkey-patch subprocess.run in the runtime.pi_agent module."""
     import subprocess
-    from agent_q import pi_agent
+    from runtime import pi_agent
 
     def fake_run(command, *args, **kwargs):
         result = mock.run(command, kwargs.get("cwd") or Path("."), kwargs.get("env") or {}, kwargs.get("timeout") or 0)
