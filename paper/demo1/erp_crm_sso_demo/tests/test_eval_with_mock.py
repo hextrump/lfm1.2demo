@@ -17,7 +17,7 @@ from scripts.eval_agent_p import CASES  # noqa: E402
 def run_with_mode(mode: str) -> tuple[int, int]:
     mock = MockPi(mode=mode)
     patch_subprocess(mock)
-    from agent_q import PiAgentRuntime  # noqa: E402
+    from runtime import PiAgentRuntime  # noqa: E402
 
     runtime = PiAgentRuntime()
     failed = 0

@@ -1,0 +1,26 @@
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Pi local runtime state
+.pi-agent/sessions/
+
+# Local model files
+*.gguf
+models/*.gguf
+
+# Runtime/cache files
+*.log
+erp_state/*.tmp
+
+# OS/editor files
+.DS_Store
+Thumbs.db

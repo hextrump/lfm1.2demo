@@ -17,7 +17,7 @@ from tests.mock_pi import MockPi, patch_subprocess  # noqa: E402
 
 
 def check_imports() -> None:
-    from agent_q import PiAgentRuntime
+    from runtime import PiAgentRuntime
     from scripts import eval_agent_p
     from scripts import build_agent_training_data
     from scripts import train_lora  # noqa: F401
@@ -48,7 +48,7 @@ def check_eval_with_mock() -> None:
 
     mock = MockPi(mode="ok")
     patch_subprocess(mock)
-    from agent_q import PiAgentRuntime
+    from runtime import PiAgentRuntime
 
     runtime = PiAgentRuntime()
     failed = 0
@@ -73,7 +73,7 @@ def check_eval_with_mock() -> None:
 
 
 def check_audit_data() -> None:
-    from agent_q.pi_agent import SCENARIOS, ERP_INTENT_PATTERNS, TICKET_INTENT_PATTERNS
+    from runtime.pi_agent import SCENARIOS, ERP_INTENT_PATTERNS, TICKET_INTENT_PATTERNS
 
     assert len(SCENARIOS) >= 6, f"expected >=6 scenarios, got {len(SCENARIOS)}"
     assert "aadsts" in " ".join(ERP_INTENT_PATTERNS).lower()

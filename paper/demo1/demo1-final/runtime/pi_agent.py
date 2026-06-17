@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Any
 
 APP_DIR = Path(__file__).resolve().parents[1]
-PI_CLI = APP_DIR / "node_modules" / ".bin" / "pi"
-PI_AGENT_DIR = APP_DIR / ".pi-agent"
-PI_ERP_EXTENSION = APP_DIR / "agent_q" / "pi_erp_extension.ts"
+PI_BIN_DIR = APP_DIR / "node_modules" / ".bin"
+_DEFAULT_PI_CLI = PI_BIN_DIR / ("pi.cmd" if os.name == "nt" else "pi")
+PI_CLI = Path(os.environ.get("PI_CLI_PATH", str(_DEFAULT_PI_CLI)))
+PI_AGENT_DIR = Path(os.environ.get("PI_AGENT_DIR", str(APP_DIR / ".pi-agent")))
+PI_ERP_EXTENSION = APP_DIR / "runtime" / "pi_erp_extension.ts"
 PI_ERP_SKILL = APP_DIR / ".pi" / "skills" / "erp-support"
 KNOWLEDGE_DIR = APP_DIR / "knowledge"
 CURRENT_ERROR_PATH = APP_DIR / "erp_state" / "current_error.json"
 PI_PROVIDER = "local-lfm"
-PI_MODEL = "lfm2.5-1.2b-instruct-q4_k_m.gguf"
+PI_MODEL = "lfm2.5-1.2b-instruct"
 PI_TIMEOUT_SECONDS = 90
 PI_TOOL_RETRY_LIMIT = 2
 
@@ -305,6 +307,8 @@ class PiAgentRuntime:
                 capture_output=True,
                 text=True,
                 timeout=PI_TIMEOUT_SECONDS,
+                encoding="utf-8",
+                errors="replace",
             )
         except subprocess.TimeoutExpired:
             return PiAgentResult(
