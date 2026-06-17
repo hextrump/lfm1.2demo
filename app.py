@@ -579,24 +579,24 @@ def render_live_tail_console(sse_url: str, height_px: int = 220, max_lines: int 
     html = f"""
 <style>
   html, body {{ margin: 0; padding: 0; background: transparent; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
-  .live-tail {{ margin: 0 0 12px 0; border-radius: 6px; border: 1px solid #1e293b; background: #0f172a; color: #cbd5e1; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.45; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }}
-  .live-tail-head {{ display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1e293b; border-bottom: 1px solid #334155; font-size: 10.5px; color: #94a3b8; }}
-  .live-tail-dot {{ width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; flex: 0 0 8px; }}
-  .live-tail-dot.lt-live {{ background: #22c55e; box-shadow: 0 0 6px #22c55e; animation: lt-pulse 1.6s ease-in-out infinite; }}
+  /* Subtle, card-friendly design that blends into Agent P / Support session. */
+  .live-tail {{ margin: 6px 0 0 0; border-radius: 0; border: 0; border-top: 1px solid #f3f4f6; background: transparent; color: #4b5563; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10px; line-height: 1.4; overflow: hidden; }}
+  .live-tail-head {{ display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #f9fafb; border-bottom: 1px solid #f3f4f6; font-size: 9.5px; color: #6b7280; }}
+  .live-tail-dot {{ width: 6px; height: 6px; border-radius: 50%; background: #d1d5db; flex: 0 0 6px; }}
+  .live-tail-dot.lt-live {{ background: #10b981; }}
   .live-tail-dot.lt-connecting {{ background: #fbbf24; }}
   .live-tail-dot.lt-error {{ background: #ef4444; }}
-  @keyframes lt-pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
-  .live-tail-title {{ color: #cbd5e1; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; }}
-  .live-tail-file {{ color: #64748b; font-size: 10px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .live-tail-count {{ color: #64748b; font-size: 10px; }}
-  .live-tail-btn {{ background: transparent; border: 1px solid #334155; color: #94a3b8; cursor: pointer; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-family: inherit; }}
-  .live-tail-btn:hover {{ color: #cbd5e1; border-color: #475569; }}
-  .live-tail-body {{ margin: 0; padding: 6px 10px; overflow-y: auto; overflow-x: hidden; background: #0f172a; white-space: pre-wrap; word-break: break-all; min-height: 60px; }}
-  .live-tail-empty {{ color: #475569; font-style: italic; padding: 8px 0; }}
-  .lt-line {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10.5px; line-height: 1.45; padding: 1px 0; }}
-  .lt-ts {{ color: #475569; }}
+  .live-tail-title {{ color: #6b7280; font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; font-size: 9px; }}
+  .live-tail-file {{ color: #9ca3af; font-size: 9px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .live-tail-count {{ color: #9ca3af; font-size: 9px; }}
+  .live-tail-btn {{ background: transparent; border: 1px solid #e5e7eb; color: #9ca3af; cursor: pointer; padding: 0 5px; border-radius: 3px; font-size: 9px; line-height: 14px; font-family: inherit; }}
+  .live-tail-btn:hover {{ color: #4b5563; border-color: #9ca3af; background: #f3f4f6; }}
+  .live-tail-body {{ margin: 0; padding: 4px 8px; overflow-y: auto; overflow-x: hidden; background: #ffffff; white-space: pre-wrap; word-break: break-all; min-height: 32px; max-height: 140px; }}
+  .live-tail-empty {{ color: #9ca3af; font-style: italic; padding: 4px 0; font-size: 9.5px; }}
+  .lt-line {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 9.5px; line-height: 1.4; padding: 0; }}
+  .lt-ts {{ color: #9ca3af; }}
   .lt-kind {{ font-weight: 600; }}
-  .lt-text {{ color: #cbd5e1; }}
+  .lt-text {{ color: #4b5563; }}
 </style>
 <div id="live-tail" class="live-tail">
   <div class="live-tail-head">
@@ -625,23 +625,24 @@ def render_live_tail_console(sse_url: str, height_px: int = 220, max_lines: int 
     const m = line.match(/^(\\[[0-9:]+\\])\\s+(\\[[a-z]+\\])\\s*(.*)$/);
     if (!m) return escapeHtml(line);
     const ts = m[1], kind = m[2].slice(1, -1).toLowerCase(), body = m[3];
+    // Darker shades that read well on a white background.
     const kindColors = {{
-      'model': '#34d399',
-      'tool':  '#60a5fa',
-      'args':  '#fbbf24',
-      'exec':  '#60a5fa',
-      'kb':    '#c084fc',
-      'match': '#c084fc',
-      'ticket':'#f59e0b',
-      'stream':'#a78bfa',
-      'reply': '#a78bfa',
-      'done':  '#10b981',
-      'error': '#f87171',
-      'retry': '#f87171',
-      'server':'#94a3b8',
-      'turn':  '#22d3ee',
+      'model': '#047857',  // emerald-700
+      'tool':  '#1d4ed8',  // blue-700
+      'args':  '#b45309',  // amber-700
+      'exec':  '#1d4ed8',
+      'kb':    '#6d28d9',  // violet-700
+      'match': '#6d28d9',
+      'ticket':'#c2410c',  // orange-700
+      'stream':'#4338ca',  // indigo-700
+      'reply': '#4338ca',
+      'done':  '#047857',
+      'error': '#b91c1c',  // red-700
+      'retry': '#b91c1c',
+      'server':'#6b7280',  // gray-500
+      'turn':  '#0e7490',  // cyan-700
     }};
-    const color = kindColors[kind] || '#cbd5e1';
+    const color = kindColors[kind] || '#6b7280';
     return `<span class="lt-ts">${{escapeHtml(ts)}}</span> ` +
            `<span class="lt-kind" style="color:${{color}}">[${{escapeHtml(kind)}}]</span> ` +
            `<span class="lt-text">${{escapeHtml(body)}}</span>`;
@@ -721,22 +722,25 @@ def render_live_tail_console(sse_url: str, height_px: int = 220, max_lines: int 
 
 
 def stream_text(user_text: str, text: str, placeholder: Any, timeline: list[TimelineEvent] | None = None, turn_t0: float | None = None) -> None:
-    output = ""
-    # Stream one character at a time for visible word-by-word flow.
-    for ch in text:
-        output += ch
-        if turn_t0 is not None and timeline is not None:
-            drain_server_log_to_timeline(timeline, turn_t0)
-        render_chat_container(
-            placeholder,
-            st.session_state.employee_messages,
-            user_text,
-            output,
-            pending_timeline=timeline,
-            pending_running=False,
-        )
-        # Slightly faster for ASCII, slower for CJK to keep a natural cadence.
-        time.sleep(0.014 if ord(ch) < 128 else 0.022)
+    """Render the model reply in one shot.
+
+    The previous version simulated streaming by emitting one character at a
+    time with a sleep, but the LFM model is invoked non-streaming via the
+    Pi CLI, so the full reply is already in `text` by the time we get here.
+    Faking a per-character animation just delays the user seeing the
+    answer. Now: drain the live tail one last time and render the final
+    reply in a single update.
+    """
+    if turn_t0 is not None and timeline is not None:
+        drain_server_log_to_timeline(timeline, turn_t0)
+    render_chat_container(
+        placeholder,
+        st.session_state.employee_messages,
+        user_text,
+        text,
+        pending_timeline=timeline,
+        pending_running=False,
+    )
 
 
 def run_employee_chat_live(
@@ -1595,16 +1599,19 @@ Timestamp: {active_error['timestamp']}
 
     with right:
         evidence_preview = st.session_state.last_agent_evidence
-        render_assistant_header(scenario)
-        # Live Tail Console — terminal-style SSE feed of all agent activity
-        # (business events + translated llama-server log). Sits above the
-        # chat, scrolls automatically, only shows the last 12 lines.
-        if st.session_state.get("live_tail_enabled", True):
-            sse_url = os.environ.get("LIVE_TAIL_SSE_URL", "http://127.0.0.1:8765/sse?log=/tmp/demo1_live_tail.log")
-            try:
-                render_live_tail_console(sse_url, height_px=220, max_lines=12)
-            except Exception as exc:
-                st.caption(f"⚠ live tail unavailable: {exc}")
+        # Wrap Agent P header + Live Tail Console in a single bordered
+        # container so the activity feed reads as PART of the Agent P
+        # section, not a separate card floating below it.
+        with st.container(border=True):
+            render_assistant_header(scenario)
+            # Live Tail Console — terminal-style SSE feed of all agent
+            # activity. Embedded INSIDE the Agent P card.
+            if st.session_state.get("live_tail_enabled", True):
+                sse_url = os.environ.get("LIVE_TAIL_SSE_URL", "http://127.0.0.1:8765/sse?log=/tmp/demo1_live_tail.log")
+                try:
+                    render_live_tail_console(sse_url, height_px=160, max_lines=8)
+                except Exception as exc:
+                    st.caption(f"⚠ live tail unavailable: {exc}")
         chat_placeholder = st.empty()
         render_chat_container(chat_placeholder, st.session_state.employee_messages)
         render_evidence_chips(evidence_preview)
