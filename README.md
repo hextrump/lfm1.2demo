@@ -3,6 +3,18 @@
 > 社内サポート AI デモ。LFM2-1.2B Tool をローカルで動かし、ERP / CRM / SSO
 > 問い合わせ対応 + IT チケット運用を**完全オフライン**で実行。
 
+Local enterprise support agent demo using:
+
+- LFM2 1.2B Tool running locally through llama.cpp
+- Pi agent runtime
+- Simulated ERP / CRM / SSO tools
+- Local enterprise knowledge search with ripgrep
+- Streamlit web UI
+
+The demo shows how a small local model can help users troubleshoot ERP login,
+permission, license, Power BI, and support ticket workflows without sending
+business data to an external API.
+
 ---
 
 ## アーキテクチャ
