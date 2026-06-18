@@ -40,6 +40,29 @@ TICKET_INTENT_PATTERNS = [
     "create ticket", "contact it", "連絡して",
 ]
 
+# IT-side action intent patterns — used by chat_it() to bypass the model
+# when the user clearly wants to Triage/Resolve/Close/Reassign/comment on
+# a ticket. The 1.2B model hallucinates ticket IDs and resolution notes
+# (see _create_ticket_directly docstring for the same problem on creation).
+IT_RESOLVE_PATTERNS = [
+    "解決して", "解決する", "解決します", "解決マーク", "resolve",
+    "解決して", "resolved にして", "解決済み",
+]
+IT_CLOSE_PATTERNS = [
+    "クローズして", "クローズする", "閉じる", "closed にして", "close",
+    "关闭", "クローズ",
+]
+IT_REASSIGN_PATTERNS = [
+    "再分派", "再アサイン", "担当変更", "transfer", "reassign",
+    "重新分派", "引き継ぎ",
+]
+IT_TRIAGE_PATTERNS = [
+    "トリアージして", "triage", "triaged にして",
+]
+IT_COMMENT_PATTERNS = [
+    "コメント", "comment", "评论", "備考",
+]
+
 ERP_ANALYSIS_TOOLS = [
     "erp_analyze_pasted_error_with_kb",
 ]
@@ -207,6 +230,14 @@ class PiAgentRuntime:
                 reply="IT Agent P is not available.",
                 events=[PiAgentEvent("it_agent", "error", "missing CLI, config, extension, or skill")],
             )
+        # Code-level short-circuit: when the user clearly wants to take
+        # an action (resolve/close/reassign/triage/comment), bypass the
+        # 1.2B model and call the Python mutator directly. The model
+        # hallucinates ticket IDs and resolution notes — same problem we
+        # solved with _create_ticket_directly() on the Employee side.
+        direct = self._direct_it_action(user_text)
+        if direct is not None:
+            return direct
         env = os.environ.copy()
         env.update({
             "PI_CODING_AGENT_DIR": str(self.pi_agent_dir),
@@ -1086,6 +1117,156 @@ class PiAgentRuntime:
             ticket=ticket,
             evidence=evidence,
             events=[PiAgentEvent("erp_create_ticket_from_current_error", "ok", json.dumps(ticket, ensure_ascii=False)[:240])],
+        )
+
+    # ── IT-side action short-circuit (mirror of _create_ticket_directly) ──
+    # The 1.2B model hallucinates ticket IDs and resolution notes when the
+    # user asks the IT Agent to resolve / close / reassign / comment on a
+    # ticket. We detect the intent (Japanese verb + optional KW-#### in
+    # text), pick the ticket id, and call the Python mutator from app.py
+    # directly. Same rationale as _create_ticket_directly on the Employee
+    # side: code-level enforcement of state transitions.
+
+    _IT_TICKET_ID_RE = re.compile(r"\bKW-\d{4}\b")
+
+    def _extract_it_ticket_id(self, user_text: str) -> str | None:
+        """Pull a KW-#### ticket id out of the user's chat text, or return
+        None if none is present."""
+        if not user_text:
+            return None
+        m = self._IT_TICKET_ID_RE.search(user_text)
+        return m.group(0) if m else None
+
+    def _user_wants_it_action(self, user_text: str) -> str | None:
+        """Detect the IT-side action the user is asking for. Returns one
+        of: "resolve", "close", "reassign", "triage", "comment", or None."""
+        if not user_text:
+            return None
+        lower = user_text.lower()
+        if any(p in lower for p in IT_RESOLVE_PATTERNS):
+            return "resolve"
+        if any(p in lower for p in IT_CLOSE_PATTERNS):
+            return "close"
+        if any(p in lower for p in IT_REASSIGN_PATTERNS):
+            return "reassign"
+        if any(p in lower for p in IT_TRIAGE_PATTERNS):
+            return "triage"
+        if any(p in lower for p in IT_COMMENT_PATTERNS):
+            return "comment"
+        return None
+
+    def _get_app_mutators(self):
+        """Lazy-fetch the ticket mutators from app.py via sys.modules.
+        Cached after first call. Using sys.modules avoids re-importing
+        app.py inside an active streamlit rerun (which can re-trigger
+        UI rendering and cause "duplicate radio" warnings)."""
+        if getattr(self, "_app_mutators", None) is not None:
+            return self._app_mutators
+        import sys as _sys
+        app_mod = _sys.modules.get("app")
+        if app_mod is None:
+            # Fallback: not loaded yet (e.g. running tests). Import it.
+            import importlib
+            app_mod = importlib.import_module("app")
+        self._app_mutators = (
+            app_mod.resolve_ticket,
+            app_mod.close_ticket,
+            app_mod.reassign_ticket,
+            app_mod.triage_ticket,
+            app_mod.add_comment_to_ticket,
+        )
+        return self._app_mutators
+
+    def _direct_it_action(self, user_text: str) -> PiAgentResult | None:
+        """If user_text expresses an IT action (resolve/close/...), perform
+        it via the Python mutator and return a Japanese reply. Returns
+        None if the message is not an action request — caller falls
+        through to the LLM path."""
+        action = self._user_wants_it_action(user_text)
+        if action is None:
+            return None
+        # Determine the target ticket: explicit KW-#### in text first,
+        # else fall back to the currently-selected ticket in session_state.
+        ticket_id = self._extract_it_ticket_id(user_text)
+        if ticket_id is None:
+            try:
+                import streamlit as _st
+                # session_state may be missing keys; use .get with default
+                ticket_id = _st.session_state.get("selected_it_ticket")
+            except Exception:
+                ticket_id = None
+        if ticket_id is None:
+            return PiAgentResult(
+                reply=(
+                    "**IT アクションの実行にはチケットIDが必要です**\n\n"
+                    "チャットで `KW-#### を解決して` のように明示するか、"
+                    "左側のチケット詳細ボックスから対象を選択してください。\n\n"
+                    "アクション: 解決 / クローズ / 再分派 / トリアージ / コメント"
+                ),
+                events=[PiAgentEvent("it_action_shortcut", "missing_ticket_id", user_text)],
+            )
+        # Dispatch to the matching mutator (cached import).
+        try:
+            resolve_t, close_t, reassign_t, triage_t, comment_t = self._get_app_mutators()
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            return PiAgentResult(
+                reply=f"IT アクションを処理できません: {exc}",
+                events=[PiAgentEvent("it_action_shortcut", "error", f"{exc}\n{tb}"[:500])],
+            )
+        if action == "resolve":
+            try:
+                ok, msg, new_t = resolve_t(ticket_id, user_text)
+            except Exception as exc:
+                import traceback
+                return PiAgentResult(
+                    reply=f"resolve failed: {exc}\n\n```\n{traceback.format_exc()}\n```",
+                    events=[PiAgentEvent("it_action_shortcut", "resolve_error", str(exc))],
+                )
+        elif action == "close":
+            try:
+                ok, msg, new_t = close_t(ticket_id)
+            except Exception as exc:
+                import traceback
+                return PiAgentResult(
+                    reply=f"close failed: {exc}\n\n```\n{traceback.format_exc()}\n```",
+                    events=[PiAgentEvent("it_action_shortcut", "close_error", str(exc))],
+                )
+        elif action == "reassign":
+            after = re.sub(
+                r".*?(再分派|再アサイン|担当変更|transfer|reassign|重新分派|引き継ぎ)",
+                "", user_text, flags=re.IGNORECASE,
+            ).strip(" 　→->")
+            ok, msg, new_t = reassign_t(ticket_id, after or "IT Operations")
+        elif action == "triage":
+            ok, msg, new_t = triage_t(ticket_id, notes=user_text)
+        else:  # comment
+            note = re.sub(
+                r"^\s*(コメント|comment|评论|備考)[:：]?\s*",
+                "", user_text, flags=re.IGNORECASE,
+            ).strip()
+            ok, msg, new_t = comment_t(ticket_id, note or user_text)
+        status = new_t.get("status") if new_t else "?"
+        verb_jp = {
+            "resolve": "解決",
+            "close": "クローズ",
+            "reassign": "再分派",
+            "triage": "トリアージ",
+            "comment": "コメント",
+        }[action]
+        reply = (
+            f"**{ticket_id} を {verb_jp}しました**\n\n"
+            f"- **ステータス:** {status}\n"
+            f"- **メッセージ:** {msg}\n"
+        ) if ok else (
+            f"**{ticket_id} の {verb_jp}に失敗しました**\n\n"
+            f"- **エラー:** {msg}\n"
+        )
+        return PiAgentResult(
+            reply=reply,
+            ticket=new_t,
+            events=[PiAgentEvent(f"erp_it_{action}_ticket", "ok" if ok else "error", msg[:200])],
         )
 
     def _load_scenarios(self) -> dict[str, dict[str, Any]]:

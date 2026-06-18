@@ -1912,6 +1912,9 @@ elif menu == "IT Operations":
                 [t["ticket_id"] for t in st.session_state.tickets],
                 label_visibility="collapsed",
             )
+            # Expose the selected ticket id so chat_it() can pick it up
+            # when the user types an action verb without a KW-#### prefix.
+            st.session_state["selected_it_ticket"] = selected_id
             # Selected-ticket details, in a bordered container (matches
             # the Employee Portal "Agent P" card style).
             ticket = next(t for t in st.session_state.tickets if t["ticket_id"] == selected_id)
@@ -2193,6 +2196,7 @@ elif menu == "IT Operations":
                 st.session_state.it_chat_messages.append(
                     {"role": "user", "content": it_prompt.strip()}
                 )
+                st.session_state["_it_prompt_handled"] = True
                 with st.chat_message("user"):
                     st.markdown(it_prompt.strip())
                 with st.chat_message("assistant"):
@@ -2208,7 +2212,11 @@ elif menu == "IT Operations":
                 ):
                     load_persisted_tickets()
                 st.rerun()
-    if it_prompt and it_prompt.strip():
+    # Pre-existing duplicate block kept for backward compatibility, but
+    # guarded with a "did the inner block already handle this prompt?"
+    # flag so it doesn't run twice in the same script run.
+    if it_prompt and it_prompt.strip() and not st.session_state.get("_it_prompt_handled"):
+        st.session_state["_it_prompt_handled"] = True
         st.session_state.it_chat_messages.append({"role": "user", "content": it_prompt.strip()})
         # Display user message
         with st.chat_message("user"):
@@ -2224,6 +2232,9 @@ elif menu == "IT Operations":
         if any(ev.tool.startswith("erp_it_") and ev.status == "ok" for ev in reply.events):
             load_persisted_tickets()
         st.rerun()
+    elif not it_prompt:
+        # Reset the handled flag once the input is cleared on rerun.
+        st.session_state.pop("_it_prompt_handled", None)
 
 elif menu == "Knowledge Search":
     st.title("Local Knowledge Search")
