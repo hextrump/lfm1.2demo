@@ -447,6 +447,220 @@ def load_persisted_tickets() -> None:
         pass
 
 
+# ── IT-side manual ticket mutators ────────────────────────────────────────
+# These mirror the TypeScript tools in runtime/pi_erp_extension.ts
+# (erp_it_triage/resolve/close/reassign/add_comment + updateTicketInStore).
+# They are invoked from the inline action buttons on the IT Operations page
+# and bypass the LLM — same rationale as _create_ticket_directly() in
+# runtime/pi_agent.py: the 1.2B model is too unreliable for state mutations.
+# History shape and per-action timestamps match the TS tools byte-for-byte.
+
+
+def _now_iso() -> str:
+    """ISO-8601 timestamp matching the TS nowIso() helper."""
+    return datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _append_history(t: dict, entry: dict) -> list[dict]:
+    """Append to a ticket's history list, initialising if missing."""
+    return [*t.get("history"), entry] if t.get("history") else [entry]
+
+
+def _find_ticket_in_disk_store(ticket_id: str) -> tuple[dict | None, str | None]:
+    """Read tickets.json, return (ticket, error_msg). Operates on the
+    on-disk truth so mutations are safe even if session_state is stale."""
+    if not TICKETS_DISK_PATH.exists():
+        return None, f"tickets.json が見つかりません ({TICKETS_DISK_PATH})"
+    try:
+        data = json.loads(TICKETS_DISK_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"tickets.json 読み込み失敗: {exc}"
+    for t in data.get("tickets", []):
+        if t.get("ticket_id") == ticket_id:
+            return t, None
+    return None, f"チケット {ticket_id} が見つかりません"
+
+
+def _write_ticket(t: dict) -> str | None:
+    """Replace the matching ticket in tickets.json in place. Returns an
+    error message on failure, None on success. Mirrors updateTicketInStore()
+    in runtime/pi_erp_extension.ts."""
+    try:
+        data = json.loads(TICKETS_DISK_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {"tickets": []}
+    tickets = data.get("tickets", [])
+    idx = next(
+        (i for i, x in enumerate(tickets) if x.get("ticket_id") == t.get("ticket_id")),
+        -1,
+    )
+    if idx < 0:
+        return f"チケット {t.get('ticket_id')} が見つかりません"
+    tickets[idx] = t
+    try:
+        TICKETS_DISK_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        return f"tickets.json 書き込み失敗: {exc}"
+    return None
+
+
+def _sync_session_state_ticket(new_t: dict) -> None:
+    """After a successful disk write, replace the matching ticket in
+    st.session_state.tickets in place (preserves list ordering so the
+    on-screen table doesn't jump rows). Append if missing."""
+    for i, t in enumerate(st.session_state.tickets):
+        if t.get("ticket_id") == new_t.get("ticket_id"):
+            st.session_state.tickets[i] = new_t
+            return
+    st.session_state.tickets.append(new_t)
+
+
+def triage_ticket(
+    ticket_id: str,
+    *,
+    priority: str | None = None,
+    new_route: str | None = None,
+    notes: str = "",
+) -> tuple[bool, str, dict | None]:
+    """Mark a New ticket as Triaged. Mirrors erp_it_triage_ticket."""
+    t, err = _find_ticket_in_disk_store(ticket_id)
+    if err:
+        return (False, err, None)
+    if t.get("status") != "New":
+        return (
+            False,
+            f"Triage は 'New' チケットのみ実行可 (現在: {t.get('status')})",
+            None,
+        )
+    ts = _now_iso()
+    updated = {
+        **t,
+        "status": "Triaged",
+        "priority": priority or t.get("priority"),
+        "route": new_route or t.get("route"),
+        "triage_notes": notes,
+        "triaged_at": ts,
+        "history": _append_history(
+            t,
+            {
+                "at": ts,
+                "action": "triaged",
+                "priority": priority or t.get("priority"),
+                "route": new_route or t.get("route"),
+                "note": notes,
+            },
+        ),
+    }
+    if write_err := _write_ticket(updated):
+        return (False, write_err, None)
+    _sync_session_state_ticket(updated)
+    return (True, f"{ticket_id} を Triaged にしました", updated)
+
+
+def resolve_ticket(ticket_id: str, resolution_note: str) -> tuple[bool, str, dict | None]:
+    """Mark a ticket as Resolved. Mirrors erp_it_resolve_ticket."""
+    if not resolution_note.strip():
+        return (False, "解決内容を入力してください", None)
+    t, err = _find_ticket_in_disk_store(ticket_id)
+    if err:
+        return (False, err, None)
+    if t.get("status") == "Closed":
+        return (False, "Closed チケットは再解決できません", None)
+    ts = _now_iso()
+    updated = {
+        **t,
+        "status": "Resolved",
+        "resolution_note": resolution_note,
+        "resolved_at": ts,
+        "history": _append_history(
+            t, {"at": ts, "action": "resolved", "note": resolution_note}
+        ),
+    }
+    if write_err := _write_ticket(updated):
+        return (False, write_err, None)
+    _sync_session_state_ticket(updated)
+    return (True, f"{ticket_id} を Resolved にしました", updated)
+
+
+def close_ticket(ticket_id: str, close_note: str = "") -> tuple[bool, str, dict | None]:
+    """Mark a ticket as Closed. Mirrors erp_it_close_ticket."""
+    t, err = _find_ticket_in_disk_store(ticket_id)
+    if err:
+        return (False, err, None)
+    if t.get("status") not in ("New", "Triaged", "In Progress", "Resolved"):
+        return (
+            False,
+            f"現在のステータス ({t.get('status')}) では Close できません",
+            None,
+        )
+    ts = _now_iso()
+    updated = {
+        **t,
+        "status": "Closed",
+        "close_note": close_note,
+        "closed_at": ts,
+        "history": _append_history(
+            t, {"at": ts, "action": "closed", "note": close_note}
+        ),
+    }
+    if write_err := _write_ticket(updated):
+        return (False, write_err, None)
+    _sync_session_state_ticket(updated)
+    return (True, f"{ticket_id} を Closed にしました", updated)
+
+
+def reassign_ticket(
+    ticket_id: str, new_route: str, reason: str = ""
+) -> tuple[bool, str, dict | None]:
+    """Re-route a ticket to a new team. Mirrors erp_it_reassign_ticket."""
+    if not new_route.strip():
+        return (False, "新しい担当 (new_route) を入力してください", None)
+    t, err = _find_ticket_in_disk_store(ticket_id)
+    if err:
+        return (False, err, None)
+    ts = _now_iso()
+    updated = {
+        **t,
+        "route": new_route,
+        "reassign_reason": reason,
+        "history": _append_history(
+            t, {"at": ts, "action": "reassigned", "to": new_route, "note": reason}
+        ),
+    }
+    if write_err := _write_ticket(updated):
+        return (False, write_err, None)
+    _sync_session_state_ticket(updated)
+    return (True, f"{ticket_id} の担当を {new_route} に変更しました", updated)
+
+
+def add_comment_to_ticket(ticket_id: str, comment: str) -> tuple[bool, str, dict | None]:
+    """Append a comment to a ticket's comments[] list. Mirrors erp_it_add_comment."""
+    if not comment.strip():
+        return (False, "コメントを入力してください", None)
+    t, err = _find_ticket_in_disk_store(ticket_id)
+    if err:
+        return (False, err, None)
+    ts = _now_iso()
+    new_comment = {
+        "at": ts,
+        "author": "IT Operations Agent P (manual)",
+        "comment": comment,
+    }
+    updated = {
+        **t,
+        "comments": ([*t.get("comments"), new_comment] if t.get("comments") else [new_comment]),
+        "history": _append_history(
+            t, {"at": ts, "action": "comment", "note": comment}
+        ),
+    }
+    if write_err := _write_ticket(updated):
+        return (False, write_err, None)
+    _sync_session_state_ticket(updated)
+    return (True, f"{ticket_id} にコメントを追加しました", updated)
+
+
 def chat_rows_html(messages: list[dict[str, str]], pending_user: str | None = None, pending_assistant: str | None = None, pending_timeline: list[TimelineEvent] | None = None, pending_running: bool = False) -> str:
     rows = []
     visible_messages = messages[-20:]
@@ -1732,6 +1946,197 @@ elif menu == "IT Operations":
                 if blocked:
                     st.markdown("**Blocked actions**")
                     st.write(", ".join(blocked))
+
+                # ── Inline status action buttons ────────────────────────
+                # Jira / ServiceNow-style controls: Triage / Resolve /
+                # Close / Reassign + an Add Comment expander. Status-aware
+                # disabled matrix; destructive Close uses a two-click
+                # confirm via st.session_state["pending_close_id"].
+                st.markdown("---")
+                st.markdown("**Actions**")
+                ticket_id = ticket["ticket_id"]
+                cur_status = ticket.get("status", "New")
+
+                # Row 1: one-click status-aware buttons
+                b1, b2, b3, b4 = st.columns(4)
+                with b1:
+                    triage_clicked = st.button(
+                        "Triage",
+                        key=f"triage_{ticket_id}",
+                        disabled=cur_status != "New",
+                        use_container_width=True,
+                    )
+                with b2:
+                    resolve_clicked = st.button(
+                        "Resolve",
+                        key=f"resolve_{ticket_id}",
+                        type="primary",
+                        disabled=cur_status == "Closed",
+                        use_container_width=True,
+                    )
+                with b3:
+                    close_clicked = st.button(
+                        "Close",
+                        key=f"close_{ticket_id}",
+                        disabled=cur_status == "Closed",
+                        use_container_width=True,
+                    )
+                with b4:
+                    reassign_clicked = st.button(
+                        "Reassign",
+                        key=f"reassign_{ticket_id}",
+                        disabled=cur_status == "Closed",
+                        use_container_width=True,
+                    )
+
+                # Row 2: Apply status change (input-required actions)
+                with st.expander("Apply status change (with note)", expanded=False):
+                    action_choice = st.selectbox(
+                        "Action",
+                        ["Resolve", "Triage (override priority/route)", "Reassign"],
+                        key=f"action_choice_{ticket_id}",
+                        label_visibility="collapsed",
+                    )
+                    note = st.text_area(
+                        "Note",
+                        key=f"action_note_{ticket_id}",
+                        placeholder=(
+                            "解決内容を入力…"
+                            if action_choice == "Resolve"
+                            else "Triage notes / Reassign reason"
+                        ),
+                        height=80,
+                        label_visibility="collapsed",
+                    )
+                    new_priority = None
+                    new_route = None
+                    if action_choice == "Triage (override priority/route)":
+                        p1, p2 = st.columns(2)
+                        new_priority = p1.text_input(
+                            "New priority (P1/P2/P3)", key=f"prio_{ticket_id}"
+                        )
+                        new_route = p2.text_input("New route", key=f"route_{ticket_id}")
+                    elif action_choice == "Reassign":
+                        new_route = st.text_input(
+                            "New route (required)", key=f"newroute_{ticket_id}"
+                        )
+                    apply_clicked = st.button(
+                        "Apply", key=f"apply_{ticket_id}", type="primary"
+                    )
+                    if apply_clicked:
+                        if action_choice == "Resolve":
+                            ok, msg, _ = resolve_ticket(ticket_id, note)
+                            audit_action = "manual_resolve"
+                        elif action_choice.startswith("Triage"):
+                            ok, msg, _ = triage_ticket(
+                                ticket_id,
+                                priority=new_priority or None,
+                                new_route=new_route or None,
+                                notes=note,
+                            )
+                            audit_action = "manual_triage"
+                        else:  # Reassign
+                            ok, msg, _ = reassign_ticket(
+                                ticket_id, new_route or "", reason=note
+                            )
+                            audit_action = "manual_reassign"
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            add_audit(
+                                "IT Operations Agent",
+                                audit_action,
+                                ticket_id,
+                                (note or "")[:60],
+                                "Low",
+                            )
+                            st.rerun()
+
+                # One-click button handlers (no extra input)
+                if triage_clicked and cur_status == "New":
+                    ok, msg, _ = triage_ticket(
+                        ticket_id, notes="Quick triage (default)"
+                    )
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        add_audit(
+                            "IT Operations Agent",
+                            "manual_triage",
+                            ticket_id,
+                            "default",
+                            "Low",
+                        )
+                        st.rerun()
+
+                if resolve_clicked:
+                    st.info(
+                        "Resolve には note が必要です。下の「Apply status change」を開いてください。"
+                    )
+
+                if reassign_clicked:
+                    st.info(
+                        "Reassign には新しい担当が必要です。下の「Apply status change」を開いてください。"
+                    )
+
+                if close_clicked:
+                    st.session_state["pending_close_id"] = ticket_id
+                    st.rerun()
+
+                # Close confirmation (two-click pattern)
+                if st.session_state.get("pending_close_id") == ticket_id:
+                    st.warning(
+                        f"{ticket_id} を Closed にします。よろしければもう一度「Confirm close」を押してください。"
+                    )
+                    cc1, cc2 = st.columns([1, 4])
+                    with cc1:
+                        confirm_close = st.button(
+                            "Confirm close",
+                            key=f"confirm_close_{ticket_id}",
+                            type="primary",
+                        )
+                    with cc2:
+                        cancel_close = st.button(
+                            "Cancel", key=f"cancel_close_{ticket_id}"
+                        )
+                    if confirm_close:
+                        ok, msg, _ = close_ticket(ticket_id)
+                        (st.success if ok else st.error)(msg)
+                        st.session_state.pop("pending_close_id", None)
+                        if ok:
+                            add_audit(
+                                "IT Operations Agent",
+                                "manual_close",
+                                ticket_id,
+                                "",
+                                "Low",
+                            )
+                            st.rerun()
+                    if cancel_close:
+                        st.session_state.pop("pending_close_id", None)
+                        st.rerun()
+
+                # Row 3: Add Comment (collapsible)
+                with st.expander("Add comment", expanded=False):
+                    comment_text = st.text_area(
+                        "Comment",
+                        key=f"comment_{ticket_id}",
+                        height=80,
+                        label_visibility="collapsed",
+                        placeholder="コメントを入力…",
+                    )
+                    if st.button(
+                        "Post comment", key=f"post_comment_{ticket_id}"
+                    ):
+                        ok, msg, _ = add_comment_to_ticket(ticket_id, comment_text)
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            add_audit(
+                                "IT Operations Agent",
+                                "manual_comment",
+                                ticket_id,
+                                comment_text[:60],
+                                "Low",
+                            )
+                            st.rerun()
         else:
             st.info("No tickets yet. Create one from Employee Portal.")
     # ── RIGHT COLUMN: IT Agent P card (mirrors Employee Portal's Agent P) ──
