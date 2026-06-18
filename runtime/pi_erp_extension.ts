@@ -9,6 +9,33 @@ const execFileAsync = promisify(execFile);
 const appDir = resolve(__dirname, "..");
 const knowledgeDir = resolve(appDir, "knowledge");
 const currentErrorPath = resolve(appDir, "erp_state", "current_error.json");
+const ticketsPath = resolve(appDir, "erp_state", "tickets.json");
+
+async function readTicketsStore(): Promise<{ tickets: any[] }> {
+  try {
+    const text = await readFile(ticketsPath, "utf8");
+    return JSON.parse(text);
+  } catch (_error) {
+    return { tickets: [] };
+  }
+}
+
+async function writeTicketsStore(store: { tickets: any[] }): Promise<void> {
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  await mkdir(dirname(ticketsPath), { recursive: true });
+  await writeFile(ticketsPath, JSON.stringify(store, null, 2), "utf8");
+}
+
+const TICKET_STATUSES = ["New", "Triaged", "In Progress", "Resolved", "Closed"] as const;
+type TicketStatus = (typeof TICKET_STATUSES)[number];
+
+function asString(v: unknown, fallback = ""): string {
+  return v == null ? fallback : String(v);
+}
+function nowIso(): string {
+  return new Date().toISOString();
+}
 
 type ScenarioKey =
 	| "AADSTS50076"
@@ -536,6 +563,253 @@ const erpExecuteAdminAction = defineTool({
 	},
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// IT Agent tools — for the IT Operations page agent that triages / resolves /
+// closes / re-assigns / comments on tickets persisted in erp_state/tickets.json
+// ═══════════════════════════════════════════════════════════════════════════
+
+const erpItListTickets = defineTool({
+	name: "erp_it_list_tickets",
+	label: "List IT Tickets",
+	description: "List tickets in the IT Operations queue with optional filters.",
+	promptSnippet: "List IT tickets in the queue.",
+	promptGuidelines: [
+		"Use this tool to see what tickets are open / triaged / in progress / resolved / closed.",
+		"Optional filters: status, priority, scenario_key.",
+	],
+	parameters: Type.Object({
+		status: Type.Optional(Type.String({ description: "Filter by status: New / Triaged / In Progress / Resolved / Closed" })),
+		priority: Type.Optional(Type.String({ description: "Filter by priority: P1 / P2 / P3" })),
+		scenario_key: Type.Optional(Type.String({ description: "Filter by ERP scenario key" })),
+		limit: Type.Optional(Type.Number({ description: "Max number of tickets to return (default 20)" })),
+	}),
+	async execute(_id, params) {
+		const store = await readTicketsStore();
+		const limit = Math.max(1, Math.min(params.limit ?? 20, 100));
+		let rows = store.tickets.slice();
+		if (params.status) rows = rows.filter((t: any) => t.status === params.status);
+		if (params.priority) rows = rows.filter((t: any) => t.priority === params.priority);
+		if (params.scenario_key) rows = rows.filter((t: any) => t.scenario_key === params.scenario_key);
+		rows.sort((a: any, b: any) => asString(b.created_at, "").localeCompare(asString(a.created_at, "")));
+		rows = rows.slice(0, limit);
+		return {
+			content: [{ type: "text", text: JSON.stringify({ count: rows.length, tickets: rows }, null, 2) }],
+			details: { count: rows.length, tickets: rows },
+		};
+	},
+});
+
+const erpItGetTicket = defineTool({
+	name: "erp_it_get_ticket",
+	label: "Get IT Ticket",
+	description: "Get full details for a single IT ticket by its KW-#### id, including evidence, comments, and history.",
+	promptSnippet: "Show full details of one IT ticket.",
+	promptGuidelines: [
+		"Use when the user names a specific ticket (e.g. 'KW-1234') and wants the full record.",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+	}),
+	async execute(_id, params) {
+		const store = await readTicketsStore();
+		const t = store.tickets.find((x: any) => x.ticket_id === params.ticket_id);
+		if (!t) {
+			return {
+				content: [{ type: "text", text: `Ticket ${params.ticket_id} not found.` }],
+				details: { found: false, ticket_id: params.ticket_id },
+			};
+		}
+		return {
+			content: [{ type: "text", text: JSON.stringify(t, null, 2) }],
+			details: t,
+		};
+	},
+});
+
+function updateTicketInStore(ticket_id: string, mutate: (t: any) => any): { ok: boolean; ticket?: any; error?: string } {
+	const store = (() => {
+		try {
+			const fs = require("node:fs") as typeof import("node:fs");
+			return JSON.parse(fs.readFileSync(ticketsPath, "utf8"));
+		} catch {
+			return { tickets: [] };
+		}
+	})();
+	const idx = store.tickets.findIndex((t: any) => t.ticket_id === ticket_id);
+	if (idx < 0) return { ok: false, error: `Ticket ${ticket_id} not found` };
+	store.tickets[idx] = mutate(store.tickets[idx]);
+	try {
+		const fs = require("node:fs") as typeof import("node:fs");
+		fs.writeFileSync(ticketsPath, JSON.stringify(store, null, 2), "utf8");
+	} catch (e) {
+		return { ok: false, error: `Failed to persist: ${(e as Error).message}` };
+	}
+	return { ok: true, ticket: store.tickets[idx] };
+}
+
+const erpItResolveTicket = defineTool({
+	name: "erp_it_resolve_ticket",
+	label: "Resolve IT Ticket",
+	description: "Mark an IT ticket as Resolved with a resolution note. Use this when the issue has been fixed or answered.",
+	promptSnippet: "Resolve an IT ticket with a note.",
+	promptGuidelines: [
+		"Use after you have actually fixed or answered the underlying issue.",
+		"The resolution_note is required and shown to the requester.",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+		resolution_note: Type.String({ description: "Short Japanese summary of what was done to resolve the issue" }),
+	}),
+	async execute(_id, params) {
+		const result = updateTicketInStore(params.ticket_id, (t: any) => ({
+			...t,
+			status: "Resolved",
+			resolution_note: params.resolution_note,
+			resolved_at: nowIso(),
+			history: [
+				...(Array.isArray(t.history) ? t.history : []),
+				{ at: nowIso(), action: "resolved", note: params.resolution_note },
+			],
+		}));
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: result,
+		};
+	},
+});
+
+const erpItCloseTicket = defineTool({
+	name: "erp_it_close_ticket",
+	label: "Close IT Ticket",
+	description: "Close a Resolved ticket (no further action). The requester can no longer reply.",
+	promptSnippet: "Close a resolved IT ticket.",
+	promptGuidelines: [
+		"Only use after a ticket has been Resolved (or when the requester is unresponsive and you want to archive it).",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+		close_note: Type.Optional(Type.String({ description: "Optional closing reason / archive note" })),
+	}),
+	async execute(_id, params) {
+		const result = updateTicketInStore(params.ticket_id, (t: any) => ({
+			...t,
+			status: "Closed",
+			close_note: params.close_note ?? "",
+			closed_at: nowIso(),
+			history: [
+				...(Array.isArray(t.history) ? t.history : []),
+				{ at: nowIso(), action: "closed", note: params.close_note ?? "" },
+			],
+		}));
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: result,
+		};
+	},
+});
+
+const erpItReassignTicket = defineTool({
+	name: "erp_it_reassign_ticket",
+	label: "Reassign IT Ticket",
+	description: "Change the routing team for an IT ticket (e.g. when the original route was wrong).",
+	promptSnippet: "Reassign a ticket to another team.",
+	promptGuidelines: [
+		"Use when the ticket is in the wrong queue. Provide the new route string.",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+		new_route: Type.String({ description: "New routing team, e.g. 'CRM Owner / Dynamics 管理者'" }),
+		reason: Type.Optional(Type.String({ description: "Why the ticket is being reassigned" })),
+	}),
+	async execute(_id, params) {
+		const result = updateTicketInStore(params.ticket_id, (t: any) => ({
+			...t,
+			route: params.new_route,
+			reassign_reason: params.reason ?? "",
+			history: [
+				...(Array.isArray(t.history) ? t.history : []),
+				{ at: nowIso(), action: "reassigned", to: params.new_route, note: params.reason ?? "" },
+			],
+		}));
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: result,
+		};
+	},
+});
+
+const erpItAddComment = defineTool({
+	name: "erp_it_add_comment",
+	label: "Add IT Comment",
+	description: "Append a comment to a ticket without changing its status.",
+	promptSnippet: "Add a comment to an IT ticket.",
+	promptGuidelines: [
+		"Use to add information, ask the requester for more details, or document a workaround.",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+		comment: Type.String({ description: "Comment text in Japanese" }),
+	}),
+	async execute(_id, params) {
+		const result = updateTicketInStore(params.ticket_id, (t: any) => ({
+			...t,
+			comments: [
+				...(Array.isArray(t.comments) ? t.comments : []),
+				{ at: nowIso(), author: "IT Operations Agent P", comment: params.comment },
+			],
+			history: [
+				...(Array.isArray(t.history) ? t.history : []),
+				{ at: nowIso(), action: "comment", note: params.comment },
+			],
+		}));
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: result,
+		};
+	},
+});
+
+const erpItTriageTicket = defineTool({
+	name: "erp_it_triage_ticket",
+	label: "Triage IT Ticket",
+	description: "Triage a New ticket: confirm / re-classify priority and route before working on it.",
+	promptSnippet: "Triage a new IT ticket.",
+	promptGuidelines: [
+		"Use for tickets in 'New' status before resolving.",
+		"Can optionally change priority and route based on your assessment.",
+	],
+	parameters: Type.Object({
+		ticket_id: Type.String({ description: "Ticket id, e.g. KW-1234" }),
+		priority: Type.Optional(Type.String({ description: "Override priority: P1 / P2 / P3" })),
+		new_route: Type.Optional(Type.String({ description: "Override routing team" })),
+		notes: Type.Optional(Type.String({ description: "Triage notes" })),
+	}),
+	async execute(_id, params) {
+		const result = updateTicketInStore(params.ticket_id, (t: any) => ({
+			...t,
+			status: "Triaged",
+			priority: params.priority ?? t.priority,
+			route: params.new_route ?? t.route,
+			triage_notes: params.notes ?? "",
+			triaged_at: nowIso(),
+			history: [
+				...(Array.isArray(t.history) ? t.history : []),
+				{
+					at: nowIso(),
+					action: "triaged",
+					priority: params.priority ?? t.priority,
+					route: params.new_route ?? t.route,
+					note: params.notes ?? "",
+				},
+			],
+		}));
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: result,
+		};
+	},
+});
+
 export default function erpAgentTools(pi: ExtensionAPI) {
 	pi.registerTool(erpGetCurrentError);
 	pi.registerTool(erpInspectCurrentErrorWithKb);
@@ -548,4 +822,12 @@ export default function erpAgentTools(pi: ExtensionAPI) {
 	pi.registerTool(erpCreateTicketFromCurrentError);
 	pi.registerTool(erpHandoff);
 	pi.registerTool(erpExecuteAdminAction);
+	// IT-side tools
+	pi.registerTool(erpItListTickets);
+	pi.registerTool(erpItGetTicket);
+	pi.registerTool(erpItTriageTicket);
+	pi.registerTool(erpItResolveTicket);
+	pi.registerTool(erpItCloseTicket);
+	pi.registerTool(erpItReassignTicket);
+	pi.registerTool(erpItAddComment);
 }

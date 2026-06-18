@@ -243,6 +243,9 @@ def init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Hydrate tickets from disk on first run (if any persisted from a prior
+    # session). Done after defaults so .tickets exists.
+    load_persisted_tickets()
 
 
 def now_text() -> str:
@@ -402,7 +405,46 @@ def persist_agent_result(user_text: str, result: Any) -> None:
         st.session_state.it_messages.append({"role": "assistant", "content": format_it_handoff(result.ticket)})
         add_audit("Agent P", "ticket_created", result.ticket["ticket_id"], result.ticket.get("route", ""), result.ticket.get("risk", "Low"))
         add_audit("IT Operations Agent", "agent_to_agent_received", result.ticket["ticket_id"], result.ticket.get("priority", ""), result.ticket.get("risk", "Low"))
+        # Persist to disk so the IT agent's erp_it_* tools (which read from
+        # the same file) can see / mutate the ticket across pages.
+        persist_tickets_to_disk()
     add_audit("Agent P", "chat", user_text[:60], f"{len(result.events)} tool events", "Low")
+
+
+TICKETS_DISK_PATH = ERP_STATE_DIR / "tickets.json"
+
+
+def persist_tickets_to_disk() -> None:
+    """Write the in-memory tickets list to erp_state/tickets.json.
+
+    The IT-side TypeScript tools (erp_it_*) read the same file, so this
+    keeps the in-memory UI list and the on-disk tool store in sync.
+    """
+    try:
+        TICKETS_DISK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TICKETS_DISK_PATH.write_text(
+            json.dumps({"tickets": st.session_state.tickets}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def load_persisted_tickets() -> None:
+    """Load tickets from erp_state/tickets.json into session_state on init.
+    Skips if the in-memory list is already non-empty (e.g. a ticket was
+    just created in this session)."""
+    if st.session_state.get("tickets"):
+        return
+    if not TICKETS_DISK_PATH.exists():
+        return
+    try:
+        data = json.loads(TICKETS_DISK_PATH.read_text(encoding="utf-8"))
+        for t in data.get("tickets", []):
+            if t.get("ticket_id") not in {x.get("ticket_id") for x in st.session_state.tickets}:
+                st.session_state.tickets.append(t)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 def chat_rows_html(messages: list[dict[str, str]], pending_user: str | None = None, pending_assistant: str | None = None, pending_timeline: list[TimelineEvent] | None = None, pending_running: bool = False) -> str:
@@ -1684,6 +1726,39 @@ elif menu == "IT Operations":
     if st.session_state.it_messages:
         st.markdown("### Agent handoff")
         st.markdown(st.session_state.it_messages[-1]["content"], unsafe_allow_html=True)
+
+    # ── IT Agent (P) chat box ────────────────────────────────────────────
+    st.divider()
+    st.markdown("### IT Operations Agent P")
+    st.caption("リスト / 参照 / トリアージ / 解決 / 关闭 / 重新分派 / 评论 を直接実行できます。")
+    # Initialize IT chat state
+    if "it_chat_messages" not in st.session_state:
+        st.session_state.it_chat_messages = []
+    if "it_agent_runtime" not in st.session_state:
+        from runtime.pi_agent import PiAgentRuntime, PI_IT_SKILL
+        st.session_state.it_agent_runtime = PiAgentRuntime(skill_path=PI_IT_SKILL)
+    # Display chat history
+    for msg in st.session_state.it_chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    # Chat input
+    it_prompt = st.chat_input("Message IT Agent P (e.g. '未対応チケット一覧', 'KW-1234 を解決')", key="it_chat_input")
+    if it_prompt and it_prompt.strip():
+        st.session_state.it_chat_messages.append({"role": "user", "content": it_prompt.strip()})
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(it_prompt.strip())
+        # Get agent reply
+        with st.chat_message("assistant"):
+            with st.spinner("IT Agent が考え中..."):
+                reply = st.session_state.it_agent_runtime.chat_it(it_prompt.strip())
+            # Display reply (may contain HTML like <code>)
+            st.markdown(reply.reply)
+        st.session_state.it_chat_messages.append({"role": "assistant", "content": reply.reply})
+        # If a tool updated a ticket, refresh from disk
+        if any(ev.tool.startswith("erp_it_") and ev.status == "ok" for ev in reply.events):
+            load_persisted_tickets()
+        st.rerun()
 
 elif menu == "Knowledge Search":
     st.title("Local Knowledge Search")

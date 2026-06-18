@@ -1,0 +1,88 @@
+{
+  "tickets": [
+    {
+      "ticket_id": "KW-5042",
+      "status": "New",
+      "requester": "tester@demo.local",
+      "system": "Dynamics 365",
+      "error_code": "AADSTS50076",
+      "category": "Microsoft Entra ID / MFA / Conditional Access",
+      "risk": "Medium",
+      "priority": "P3",
+      "route": "Identity / Entra ID 管理チーム",
+      "impact": "single_user",
+      "summary": "テスト用チケット / Dynamics 365 / AADSTS50076 / trace trc-persist-001",
+      "evidence": [
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 6,
+          "snippet": "## Rule SSO-001: Microsoft Entra ID / AADSTS50076 MFA 強認証"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 9,
+          "snippet": "- category: AADSTS50076 MFA 強認証"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 12,
+          "snippet": "- keywords: Microsoft Entra ID, AADSTS50076 MFA 強認証, 権限, 申請, ログイン, MFA, ライセンス, メニュー, 監査"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 13,
+          "snippet": "- policy: Microsoft Entra ID に関する AADSTS50076 MFA 強認証 の問い合わせは、利用者、部署、対象画面、発生時刻、エラーコードまたは症状を確認してから一次切り分けする。"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 66,
+          "snippet": "## Rule SSO-006: Dynamics 365 / AADSTS50076 MFA 強認証"
+        }
+      ],
+      "evidence_summary": "current ERP error and local KB evidence",
+      "blocked_actions": []
+    },
+    {
+      "ticket_id": "KW-9572",
+      "status": "New",
+      "requester": "tester@demo.local",
+      "system": "Dynamics 365",
+      "error_code": "AADSTS50076",
+      "category": "Microsoft Entra ID / MFA / Conditional Access",
+      "risk": "Medium",
+      "priority": "P3",
+      "route": "Identity / Entra ID 管理チーム",
+      "impact": "single_user",
+      "summary": "resolve test / Dynamics 365 / AADSTS50076 / trace trc-resolve-001",
+      "evidence": [
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 6,
+          "snippet": "## Rule SSO-001: Microsoft Entra ID / AADSTS50076 MFA 強認証"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 9,
+          "snippet": "- category: AADSTS50076 MFA 強認証"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 12,
+          "snippet": "- keywords: Microsoft Entra ID, AADSTS50076 MFA 強認証, 権限, 申請, ログイン, MFA, ライセンス, メニュー, 監査"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 13,
+          "snippet": "- policy: Microsoft Entra ID に関する AADSTS50076 MFA 強認証 の問い合わせは、利用者、部署、対象画面、発生時刻、エラーコードまたは症状を確認してから一次切り分けする。"
+        },
+        {
+          "path": "/home/heyas/wslcode/demo1-final/knowledge/sso/entra-id-login-errors.md",
+          "line": 66,
+          "snippet": "## Rule SSO-006: Dynamics 365 / AADSTS50076 MFA 強認証"
+        }
+      ],
+      "evidence_summary": "current ERP error and local KB evidence",
+      "blocked_actions": []
+    }
+  ]
+}

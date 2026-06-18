@@ -13,16 +13,20 @@ else
 VENV_PY := .venv/bin/python
 endif
 
-.PHONY: help install install-py install-node serve live-tail run test clean
+.PHONY: help install install-py install-node serve live-tail run test test-unit test-runtime test-ui test-all clean
 
 help:
 	@echo "Targets:"
-	@echo "  install   Install Python and Node dependencies"
-	@echo "  serve     Start llama.cpp server with LFM2 1.2B Tool"
-	@echo "  live-tail Start the Live Tail SSE server (terminal feed above chat)"
-	@echo "  run       Start the Streamlit demo"
-	@echo "  test      Run the mocked smoke test"
-	@echo "  clean     Remove local caches"
+	@echo "  install     Install Python and Node dependencies"
+	@echo "  serve       Start llama.cpp server with LFM2 1.2B Tool"
+	@echo "  live-tail   Start the Live Tail SSE server (terminal feed above chat)"
+	@echo "  run         Start the Streamlit demo"
+	@echo "  test        Run the legacy mocked smoke test"
+	@echo "  test-unit   Run unit tests only (no services needed, ~1s)"
+	@echo "  test-runtime Run runtime tests (needs llama-server, ~5-10 min)"
+	@echo "  test-ui     Run UI/Playwright tests (needs Streamlit + llama, ~3 min)"
+	@echo "  test-all    Run unit + runtime + UI + generate HTML report"
+	@echo "  clean       Remove local caches"
 
 install: install-py install-node
 
@@ -56,6 +60,33 @@ run:
 
 test:
 	@$(VENV_PY) tests/test_eval_with_mock.py
+
+# ── pytest suites ──────────────────────────────────────────────────────
+# Each suite auto-skips if its required services are not running.
+#   test-unit   : no services needed, runs in < 1 second
+#   test-runtime: needs llama-server running on :8080
+#   test-ui     : needs Streamlit on :8501 AND llama-server on :8080
+#   test-all    : runs all three suites, generates tests/reports/report.html
+test-unit:
+	@echo "==> Running unit tests (no services required)..."
+	@$(VENV_PY) -m pytest tests/unit/ -v --tb=short
+
+test-runtime:
+	@echo "==> Running runtime tests (needs llama-server on :8080)..."
+	@$(VENV_PY) -m pytest tests/runtime/ -v --tb=short
+
+test-ui:
+	@echo "==> Running UI tests (needs Streamlit :8501 + llama :8080)..."
+	@$(VENV_PY) -m pytest tests/ui/ -v --tb=short
+
+test-all:
+	@echo "==> Running full test suite + generating report..."
+	@mkdir -p tests/reports
+	@$(VENV_PY) -m pytest tests/ \
+		--html=tests/reports/report.html --self-contained-html \
+		-v
+	@echo ""
+	@echo "Report: tests/reports/report.html"
 
 clean:
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,6 +16,7 @@ PI_CLI = Path(os.environ.get("PI_CLI_PATH", str(_DEFAULT_PI_CLI)))
 PI_AGENT_DIR = Path(os.environ.get("PI_AGENT_DIR", str(APP_DIR / ".pi-agent")))
 PI_ERP_EXTENSION = APP_DIR / "runtime" / "pi_erp_extension.ts"
 PI_ERP_SKILL = APP_DIR / ".pi" / "skills" / "erp-support"
+PI_IT_SKILL = APP_DIR / ".pi" / "skills" / "it-support"
 PI_PROVIDER = "local-lfm"
 PI_MODEL = "lfm2-1.2b-tool-q4_k_m.gguf"
 PI_TIMEOUT_SECONDS = 90
@@ -51,6 +53,16 @@ ERP_CURRENT_ERROR_TOOLS = [
 
 ERP_TICKET_TOOLS = [
     "erp_create_ticket_from_current_error",
+]
+
+IT_TOOLS = [
+    "erp_it_list_tickets",
+    "erp_it_get_ticket",
+    "erp_it_triage_ticket",
+    "erp_it_resolve_ticket",
+    "erp_it_close_ticket",
+    "erp_it_reassign_ticket",
+    "erp_it_add_comment",
 ]
 
 
@@ -105,6 +117,7 @@ class PiAgentRuntime:
         ])
 
     def chat(self, user_text: str) -> PiAgentResult:
+        self._last_user_text = user_text
         if not self.available():
             return PiAgentResult(
                 reply="Pi Agent P is not available.",
@@ -113,7 +126,6 @@ class PiAgentRuntime:
         direct_reply = self._direct_basic_reply(user_text)
         if direct_reply:
             return PiAgentResult(reply=direct_reply)
-
         env = os.environ.copy()
         env.update({
             "PI_CODING_AGENT_DIR": str(self.pi_agent_dir),
@@ -124,10 +136,31 @@ class PiAgentRuntime:
         tool_profile = self._tool_profile(user_text)
         required_tool = self._required_tool(tool_profile)
         parsed = self._run_pi(user_text, tool_profile, today, env)
+        # If the model ignored the Japanese instruction and produced a
+        # mostly-English reply, retry once with a forceful language
+        # instruction. This usually succeeds — the 1.2B model often
+        # just needs an explicit reminder mid-conversation.
+        if self._is_mostly_english(parsed.reply) and not required_tool:
+            parsed = self._run_pi(
+                user_text, tool_profile, today, env,
+                retry_instruction=(
+                    "重要: あなたの前回/現在の返答が英語になっています。"
+                    "【必ず日本語で返答してください】。"
+                    "Keep error codes like AADSTS50076, MFA, Dynamics 365, "
+                    "Power BI as-is — but ALL explanatory text, analysis, "
+                    "and questions must be in Japanese."
+                ),
+            )
         if self._has_required_tool(parsed, required_tool):
-            return parsed
+            return self._ensure_followup_questions(parsed)
         if not required_tool:
-            return parsed
+            # No tool was required. If the user asked for a ticket but the
+            # model didn't actually call the ticket tool, build the ticket
+            # in code (the 1.2B model hallucinates ticket ids/content).
+            if parsed.ticket is None and self._user_wants_ticket(user_text):
+                real = self._create_ticket_directly(user_text)
+                return self._ensure_followup_questions(real)
+            return self._ensure_followup_questions(parsed)
 
         last = parsed
         for attempt in range(1, PI_TOOL_RETRY_LIMIT + 1):
@@ -144,13 +177,365 @@ class PiAgentRuntime:
             )
             retry.events.insert(0, PiAgentEvent("pi_agent", "retry", f"missing required tool {required_tool}; attempt {attempt}"))
             if self._has_required_tool(retry, required_tool):
-                return retry
+                return self._ensure_followup_questions(retry)
             last = retry
         last.events.insert(
             0,
             PiAgentEvent("pi_agent", "error", f"required tool was not called: {required_tool}; local model returned text only"),
         )
+        # If the user asked for a ticket but the 1.2B model hallucinated a
+        # ticket in text instead of calling the tool, build a real one.
+        if self._user_wants_ticket(user_text):
+            real = self._create_ticket_directly(user_text)
+            return self._ensure_followup_questions(real)
+        # 1.2B models are too weak to reliably follow "ask follow-up questions"
+        # instructions, so we do a post-processing pass: if the model handled
+        # an erp_get_current_error or erp_analyze_pasted_error_with_kb call
+        # but the error data is vague (NO_ERROR_CODE / generic symptom / empty
+        # trace id), APPEND a numbered list of follow-up questions to the
+        # reply. The model can still lead with whatever summary it produced.
+        last = self._ensure_followup_questions(last)
         return last
+
+    def chat_it(self, user_text: str) -> PiAgentResult:
+        """Run the IT Operations Agent P. Uses the it-support skill and
+        restricts tools to erp_it_*. The model is given a different system
+        prompt that tells it to ACT on tickets, not analyze them.
+        """
+        if not self.available():
+            return PiAgentResult(
+                reply="IT Agent P is not available.",
+                events=[PiAgentEvent("it_agent", "error", "missing CLI, config, extension, or skill")],
+            )
+        env = os.environ.copy()
+        env.update({
+            "PI_CODING_AGENT_DIR": str(self.pi_agent_dir),
+            "PI_OFFLINE": "1",
+            "PI_SKIP_VERSION_CHECK": "1",
+        })
+        today = datetime.now().strftime("%Y-%m-%d %A")
+        result = self._run_pi(
+            user_text,
+            "erp_it",
+            today,
+            env,
+            skill_path=PI_IT_SKILL,
+            system_prompt=self._it_system_prompt(today),
+        )
+        return result
+
+    def _it_system_prompt(self, today: str) -> str:
+        return (
+            "You are the IT Operations Agent P, working from the IT Operations "
+            "Console. Employees in the company create ERP / CRM / SSO support "
+            "tickets from the Employee Portal; you pick them up, triage, and "
+            "resolve them. "
+            f"Current local date is {today} in Asia/Tokyo. "
+            "LANGUAGE: always respond in Japanese. Keep error codes, product "
+            "names, and ticket ids (KW-1234) as-is. "
+            "ACT, don't describe: when the user (an IT operator) asks you to "
+            "list, triage, resolve, close, reassign, or comment on a ticket, "
+            "call the corresponding erp_it_* tool immediately. Do not describe "
+            "what you would do; do it. Show the tool's returned summary in the "
+            "reply so the operator sees the new state. "
+            "Before resolving / closing / reassigning, call erp_it_get_ticket "
+            "first to confirm the current state. "
+            "If a tool returns an error, surface it to the operator verbatim. "
+            "Do not use employee-side tools (erp_get_current_error, "
+            "erp_create_ticket_from_current_error, etc.) — those are for the "
+            "Employee Portal Agent P only. "
+            "Do not call any tool for greetings or small-talk — answer in "
+            "plain Japanese."
+        )
+
+    def _ensure_followup_questions(self, result: PiAgentResult) -> PiAgentResult:
+        """Post-process the model reply so the user ALWAYS gets a Japanese
+        response with: (1) brief acknowledgement, (2) follow-up questions,
+        (3) recommended next steps from the local knowledge base.
+
+        The 1.2B model is too weak to reliably follow complex instructions,
+        so we do this in code rather than relying on the prompt.
+        """
+        # If the model already produced a good Japanese structure, skip.
+        if self._reply_already_structured(result.reply):
+            return result
+        # If the model called an inspection tool, use its data.
+        error_data: dict[str, Any] = {}
+        evidence: list[dict[str, Any]] = list(result.evidence or [])
+        inspected = any(
+            ev.tool in {
+                "erp_get_current_error",
+                "erp_analyze_pasted_error_with_kb",
+                "erp_inspect_current_error_with_kb",
+            }
+            and ev.status == "ok"
+            for ev in result.events
+        )
+        if inspected:
+            error_data = self._extract_error_data(result)
+        else:
+            # Model didn't call any tool — try to extract the error code
+            # directly from the user's pasted text so we can still build
+            # a structured response.
+            error_data = self._extract_error_from_user_text(self._last_user_text or "")
+        if not error_data and not result.reply:
+            return result
+        # If we have nothing to work with (no error code, no events), just
+        # append a generic Japanese followup.
+        if not error_data.get("error_code"):
+            # At minimum, ask the user to clarify
+            block = (
+                "**追加でお聞きしたいこと:**\n\n"
+                "1. 部署名・役職・業務への影響範囲を教えてください\n"
+                "2. 具体的なエラーメッセージ / Trace ID / Correlation ID\n"
+                "3. 最後に正常に動作していた時期\n\n"
+                "ご回答いただいた上で、社内規程に従った対応をご案内します。"
+            )
+            result.reply = (result.reply or "").rstrip() + "\n\n" + block
+            return result
+        block = self._build_response_block(error_data, evidence)
+        result.reply = (result.reply or "").rstrip() + "\n\n" + block
+        return result
+
+    @staticmethod
+    def _extract_error_from_user_text(text: str) -> dict[str, Any]:
+        """Try to pull error_code / system / symptom out of pasted text.
+        Returns a dict (possibly empty) usable by the structured-block
+        builder. Pure regex — robust enough for the common paste patterns
+        we see in this demo."""
+        if not text:
+            return {}
+        data: dict[str, Any] = {}
+        # Error code: AADSTS\d+, NO_ERROR_CODE, PBI_*, LICENSE_*, CA_BLOCK, etc.
+        m = re.search(r"\b(AADSTS\d{4,6}|PBI_[A-Z_]+|LICENSE_MISSING|CA_BLOCK|NO_ERROR_CODE)\b", text)
+        if m:
+            data["error_code"] = m.group(1)
+        # Trace ID
+        m = re.search(r"Trace\s*ID\s*[:：]?\s*([A-Za-z0-9\-]+)", text)
+        if m:
+            data["trace_id"] = m.group(1)
+        # Correlation ID
+        m = re.search(r"Correlation\s*ID\s*[:：]?\s*([A-Za-z0-9\-]+)", text)
+        if m:
+            data["correlation_id"] = m.group(1)
+        # System: looks for "Sign-in failed" → Dynamics 365 / "Sales Hub" → Dynamics 365 Sales
+        if re.search(r"sign[- ]?in|Sign[- ]?in", text):
+            data["system"] = "Dynamics 365"
+            data["symptom"] = "login_failed"
+        elif re.search(r"Sales\s*Hub|crm|Customer\s+opportunities", text, re.IGNORECASE):
+            data["system"] = "Dynamics 365 Sales"
+            data["symptom"] = "menu_missing"
+        elif re.search(r"Power\s*BI|report|workspace", text, re.IGNORECASE):
+            data["system"] = "Power BI"
+            data["symptom"] = "report_permission_denied"
+        elif re.search(r"license|License", text):
+            data["system"] = "Dynamics 365"
+            data["symptom"] = "license_missing"
+        # If the text says "additional authentication" or "MFA", set symptom
+        if re.search(r"multi[- ]?factor|additional authentication|MFA", text, re.IGNORECASE):
+            data.setdefault("symptom", "login_failed")
+        return data
+
+    def _reply_already_structured(self, reply: str) -> bool:
+        """Return True if the model already gave a CLEAN Japanese reply
+        with follow-up questions AND recommendations, so we don't need
+        to post-process. Be strict — a verbose rambling reply that
+        happens to contain the words 質問 and 推奨 is NOT structured."""
+        if not reply:
+            return False
+        # The reply must be MOSTLY Japanese (allow error codes / product
+        # names which stay in English). If it's mostly English, the model
+        # failed the language instruction and we MUST override.
+        if self._is_mostly_english(reply):
+            return False
+        # Reject verbose rambling: structured replies are short. If the
+        # reply is more than 800 chars, the model is over-explaining;
+        # force our clean block on top.
+        if len(reply) > 800:
+            return False
+        # Must have an explicit follow-up phrasing (not just the word "質問"
+        # somewhere). Look for the typical Japanese follow-up patterns.
+        has_question = any(
+            p in reply
+            for p in (
+                "教えていただけますか",
+                "お聞かせください",
+                "確認させてください",
+                "以下の点について",
+                "追加でお聞きしたい",
+            )
+        )
+        # Must have a recommendations section header.
+        has_recommendation = any(
+            p in reply
+            for p in (
+                "推奨される次のステップ",
+                "推奨される対応",
+                "次のステップ",
+                "解決策",
+            )
+        )
+        return has_question and has_recommendation
+
+    @staticmethod
+    def _is_mostly_english(text: str, threshold: float = 0.70) -> bool:
+        """Rough heuristic: ratio of ASCII letters to total non-space
+        characters. Returns True if the text is mostly English (so the
+        1.2B model failed to follow the Japanese instruction and we
+        need to override).
+
+        Threshold defaults to 0.70 — only flag as "mostly English" if
+        the text is overwhelmingly ASCII. This is conservative because
+        field-name-style Japanese replies (with English identifiers like
+        "AADSTS50076" or "Dynamics 365" mixed in) can easily exceed
+        0.45-0.50 even when the spirit of the reply is Japanese."""
+        letters = [c for c in text if c.isalpha()]
+        if len(letters) < 30:
+            return False
+        ascii_letters = [c for c in letters if ord(c) < 128]
+        return len(ascii_letters) / len(letters) > threshold
+
+    @staticmethod
+    def _extract_error_data(result: PiAgentResult) -> dict[str, Any]:
+        for ev in reversed(result.events):
+            if ev.tool not in {
+                "erp_get_current_error",
+                "erp_analyze_pasted_error_with_kb",
+                "erp_inspect_current_error_with_kb",
+            }:
+                continue
+            if ev.status != "ok":
+                continue
+            try:
+                return json.loads(ev.detail)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {}
+
+    def _build_response_block(
+        self,
+        error_data: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> str:
+        code = str(error_data.get("error_code") or "").strip() or "不明"
+        system = str(error_data.get("system") or "").strip() or "ERP"
+        symptom = str(error_data.get("symptom") or "").strip()
+        trace = str(error_data.get("trace_id") or "").strip()
+        # Build a brief acknowledgement
+        ack = f"**{code}** に関するお問い合わせですね。"
+        if system:
+            ack += f" {system} で発生しているエラーを確認しました。"
+        ack += "\n\n"
+
+        # 2-3 follow-up questions — adapt to whether the error is vague.
+        questions: list[str] = []
+        if not code or code.upper() in {"NO_ERROR_CODE", "NONE", "N/A"}:
+            questions.append("1. 正確なエラーコード(Trace ID と共にお知らせください)")
+            questions.append("2. 部署名・役職・業務への影響範囲")
+        if symptom.lower() in {
+            "menu_missing", "access_issue", "access_denied",
+            "login_failed", "permission_denied", "unknown",
+            "",  # missing symptom
+        }:
+            questions.append("1. 具体的な症状(グレーアウト / 完全に非表示 / エラーメッセージ)")
+            questions.append("2. 影響範囲(あなただけ / 部署全員 / 全体)")
+            questions.append("3. 最後に正常に動作していた時期と、その間の変更点")
+        if not questions:
+            # Even for specific errors, ask a couple of useful questions.
+            questions.append("1. このエラーは再現しますか?再現手順を教えてください")
+            questions.append("2. 他の同僚も同じエラーが出ていますか?")
+        if trace:
+            questions.append(f"3. Trace ID **{trace}** を社内サポート担当に共有済みですか?")
+        followup = (
+            "**追加でお聞きしたいこと:**\n\n"
+            + "\n".join(questions)
+            + "\n"
+        )
+
+        # Recommended next steps: synthesize from KB evidence or generate
+        # scenario-specific ones.
+        rec_lines: list[str] = []
+        if evidence:
+            for hit in evidence[:2]:
+                path = str(hit.get("path") or "").strip()
+                snippet = str(hit.get("snippet") or "").strip()
+                if not path and not snippet:
+                    continue
+                # Use a short reference, not the whole snippet
+                if path:
+                    short_path = path.split("/")[-1] if "/" in path else path
+                    rec_lines.append(f"- **{short_path}** を参照(社内規程に従った対応)")
+                if snippet:
+                    snippet = snippet[:120].replace("\n", " ")
+                    rec_lines.append(f"  - {snippet}…")
+        # Scenario-specific recommendations (kept short and safe — never
+        # recommend password reset / MFA disable / license assignment).
+        rec_lines.extend(self._scenario_recommendations(code, symptom))
+
+        if rec_lines:
+            recommendations = (
+                "**推奨される次のステップ:**\n\n"
+                + "\n".join(rec_lines[:4])
+                + "\n"
+            )
+        else:
+            recommendations = ""
+
+        return ack + followup + recommendations
+
+    @staticmethod
+    def _scenario_recommendations(code: str, symptom: str) -> list[str]:
+        """Return short, safe recommendations based on the error code.
+        These are intentionally generic — the real work happens through
+        the local KB / IT ticket handoff, not in this chat."""
+        out: list[str] = []
+        cu = code.upper()
+        if "AADSTS50076" in cu or symptom == "login_failed":
+            out.append(
+                "- Microsoft Authenticator アプリで多要素認証 (MFA) 通知を承認してください"
+            )
+            out.append(
+                "- 別デバイス / シークレットウィンドウで再ログインをお試しください"
+            )
+            out.append(
+                "- 解決しない場合は IT 部門に MFA リセットを依頼してください"
+            )
+        elif "AADSTS50105" in cu:
+            out.append(
+                "- 該当システムへのアプリケーション割り当てが、組織側で有効かご確認ください"
+            )
+            out.append(
+                "- アクセス申請フォームから上長承認を取得してください"
+            )
+        elif "LICENSE" in cu.upper() or symptom == "license_missing":
+            out.append(
+                "- Dynamics 365 / Microsoft 365 の利用開始申請をご確認ください"
+            )
+            out.append(
+                "- 上長承認後、IT 部門がライセンスを割り当てます"
+            )
+        elif "CA_BLOCK" in cu or "CONDITIONAL" in cu.upper():
+            out.append(
+                "- Conditional Access ポリシーが会社支給端末以外をブロックしています"
+            )
+            out.append(
+                "- VPN 接続後、または会社支給端末から再アクセスしてください"
+            )
+        elif "MENU" in symptom.upper() or symptom == "menu_missing":
+            out.append(
+                "- 該当システムでの Business Unit / セキュリティロールをご確認ください"
+            )
+            out.append(
+                "- CRM Owner / Dynamics 管理者にロール付与を依頼してください"
+            )
+        elif "POWERBI" in cu.upper() or "PBI" in cu:
+            out.append(
+                "- Power BI ワークスペース / レポート / データセットへの権限をご確認ください"
+            )
+            out.append(
+                "- BI 管理者 / Data Platform Team にアクセス権付与を依頼してください"
+            )
+        return out
 
     def _run_pi(
         self,
@@ -159,6 +544,8 @@ class PiAgentRuntime:
         today: str,
         env: dict[str, str],
         retry_instruction: str | None = None,
+        skill_path: Path | None = None,
+        system_prompt: str | None = None,
     ) -> PiAgentResult:
         command = [
             str(self.pi_cli),
@@ -181,15 +568,17 @@ class PiAgentRuntime:
             command.extend(["--tools", ",".join(ERP_CURRENT_ERROR_TOOLS)])
         elif tool_profile == "erp_ticket":
             command.extend(["--tools", ",".join(ERP_TICKET_TOOLS)])
+        elif tool_profile == "erp_it":
+            command.extend(["--tools", ",".join(IT_TOOLS)])
         elif tool_profile == "erp_all":
             pass
         command.extend([
             "--extension",
             str(self.extension_path),
             "--skill",
-            str(self.skill_path),
+            str(skill_path or self.skill_path),
             "--append-system-prompt",
-            self._system_prompt(tool_profile, today, retry_instruction),
+            system_prompt or self._system_prompt(tool_profile, today, retry_instruction),
             "-p",
             user_text,
         ])
@@ -241,13 +630,43 @@ class PiAgentRuntime:
 
     def _profile_instruction(self, tool_profile: str) -> str:
         if tool_profile == "none":
-            return "No tools are available. Answer directly. For date/day questions, answer exactly with the current date and weekday from this system prompt. Do not mention holidays or anniversaries."
+            return (
+                "No tools are available. Answer directly in Japanese. "
+                "For date/day questions, answer exactly with the current date and weekday "
+                "from this system prompt. Do not mention holidays or anniversaries."
+            )
         if tool_profile == "erp_analysis":
-            return "MUST call erp_analyze_pasted_error_with_kb before answering. Do not create a ticket."
+            return (
+                "MUST call erp_analyze_pasted_error_with_kb before answering. Do not create a ticket. "
+                "After the tool returns, decide whether the error data has enough context to answer. "
+                "If error_code is missing OR symptom is vague OR the user has not provided their "
+                "department / role / exact reproduction, you MUST ask 2-3 specific follow-up "
+                "questions in Japanese BEFORE giving a final answer. Do not invent missing details. "
+                "Reply structure for vague errors: 1) acknowledge briefly, 2) list specific questions, "
+                "3) stop. Do not call create_ticket in this profile."
+            )
         if tool_profile == "erp_current_error":
-            return "MUST call erp_get_current_error before answering."
+            return (
+                "MUST call erp_get_current_error before answering. Do not create a ticket. "
+                "After the tool returns, classify the error: "
+                "(A) SPECIFIC error_code + clear symptom + clear system -> you may give a direct "
+                "operational answer based on the local knowledge base. "
+                "(B) VAGUE error (error_code is 'NO_ERROR_CODE' or missing, or symptom is generic "
+                "like 'menu missing' / 'access issue' / 'cannot see') -> you MUST ask 2-3 specific "
+                "follow-up questions in Japanese BEFORE giving any operational answer. "
+                "Useful follow-ups to ask: "
+                "- 部署・役職 (department / role) "
+                "- 具体的な症状 (concrete symptom: hidden vs greyed-out vs error toast) "
+                "- 影響範囲 (scope: just you, your team, or everyone) "
+                "- 最終正常動作日時 (when did it last work) "
+                "Reply structure for vague errors: 1) acknowledge in 1 sentence, "
+                "2) numbered list of 2-3 follow-up questions, 3) stop. Do not recommend actions yet."
+            )
         if tool_profile == "erp_ticket":
-            return "MUST call erp_create_ticket_from_current_error before answering. Return the ticket id."
+            return (
+                "MUST call erp_create_ticket_from_current_error before answering. Return the ticket id. "
+                "Only proceed with a ticket if the user explicitly asked to contact IT / create a ticket."
+            )
         return "Built-in tools are available because the user asked for file, code, or system operations."
 
     def _required_tool(self, tool_profile: str) -> str | None:
@@ -272,10 +691,17 @@ class PiAgentRuntime:
             "Power BI access, and route unresolved issues to IT as tickets. "
             f"Current local date is {today} in Asia/Tokyo. "
             f"{self._profile_instruction(tool_profile)} "
-            "LANGUAGE: reply in the same language the user wrote in. "
-            "Japanese input -> Japanese. Chinese input -> Chinese. English input -> English. "
-            "Do not default to Japanese unless the user wrote in Japanese. "
+            "LANGUAGE: this is a Japanese-language internal support tool. "
+            "ALWAYS write your explanation, analysis, recommendations, and follow-up questions "
+            "in Japanese, even if the user pastes English error text or technical terms. "
+            "Keep English error codes and product names (AADSTS50076, Dynamics 365, MFA, etc.) "
+            "as-is — only the surrounding prose must be Japanese. "
+            "If the user writes in Chinese or English, still reply in Japanese. "
             "Do not mention tool names unless reporting completed tool activity. "
+            "INFORMATION GAPS: when the user's question is missing critical context "
+            "(department, exact symptom, manager's name, error reproduction, etc.), "
+            "ASK 1-3 specific follow-up questions in Japanese BEFORE giving a final answer. "
+            "Only give a complete answer when the question has enough context. "
             "If the user asks about your identity or capabilities, answer briefly in 1-2 sentences. "
             "Do not enumerate documentation files, configuration options, or training data. "
             "Do not call any tool for identity or capability questions — answer in plain text."
@@ -296,7 +722,7 @@ class PiAgentRuntime:
         # Identity questions — answer in the user's input language, never the
         # underlying model's default (which leaks pi-coding-agent identity).
         identity_patterns = (
-            "你是谁", "你叫什么", "你是什么", "你是啥", "介绍下自己", "自我介绍一下", "介绍一下你自己",
+            "你是谁", "您是谁", "你叫什么", "你是什么", "你是啥", "介绍下自己", "自我介绍一下", "介绍一下你自己",
             "who are you", "what are you", "what's your name", "introduce yourself",
             "お前は誰", "あなたは誰", "誰ですか", "自己紹介",
         )
@@ -307,7 +733,7 @@ class PiAgentRuntime:
         capability_patterns = (
             "你能做什么", "你能干啥", "你会什么", "可以做什么", "你有什么功能",
             "what can you do", "what can you help", "what do you do", "your capabilities",
-            "何ができますか", "何ができる", "何を手伝える",
+            "何ができますか", "何ができる", "何を手伝える", "何ができます",
         )
         if any(p in lower for p in capability_patterns):
             return self._capability_reply(text)
@@ -315,7 +741,7 @@ class PiAgentRuntime:
         # Date / day-of-week — answer deterministically from the system clock.
         date_patterns = (
             "今天几号", "今天日期", "今天星期", "今天周几", "周几", "星期几",
-            "what date", "what day", "today's date", "what is today",
+            "what date", "what day", "today's date", "date today", "what is today",
             "今日は何日", "今日は何曜日", "何日", "何曜日",
         )
         if any(p in lower for p in date_patterns):
@@ -542,3 +968,133 @@ class PiAgentRuntime:
         except TypeError:
             text = str(value)
         return text[:240]
+
+    def _user_wants_ticket(self, user_text: str) -> bool:
+        """Return True if the user is asking to create a ticket / contact IT."""
+        if not user_text:
+            return False
+        normalized = user_text.lower()
+        return any(p in normalized for p in TICKET_INTENT_PATTERNS)
+
+    def _create_ticket_directly(self, user_text: str) -> PiAgentResult:
+        """Build a real ticket from current_error.json + local KB — bypass
+        the model entirely. The 1.2B model hallucinates ticket IDs and
+        content (e.g. 'ERC20260117-001' with placeholder text), so we
+        read the structured state and emit a real KW-#### ticket in the
+        same format the TypeScript extension would produce.
+        """
+        from pathlib import Path as _Path
+        # Locate the active error state. The app.py writes it to
+        # erp_state/current_error.json relative to the project root.
+        err_path = _Path(__file__).resolve().parents[1] / "erp_state" / "current_error.json"
+        if not err_path.exists():
+            return PiAgentResult(
+                reply="申し訳ありません、現在アクティブなエラー情報がありません。先にシナリオを選択してください。",
+            )
+        try:
+            state = json.loads(err_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return PiAgentResult(
+                reply=f"エラー状態の読み込みに失敗しました: {exc}",
+            )
+        if not state.get("active"):
+            return PiAgentResult(
+                reply="現在、ERP画面にアクティブなエラーはありません。先に「Sign in」を実行してください。",
+            )
+
+        # Look up scenario defaults (risk / priority / route / category / etc.)
+        scenarios = getattr(self, "_scenarios", None) or self._load_scenarios()
+        scenario_key = state.get("scenario_key") or "AADSTS50076"
+        scn = scenarios.get(scenario_key, scenarios.get("AADSTS50076", {}))
+
+        # Build the ticket fields, falling back to scenario defaults.
+        system = state.get("system") or scn.get("system", "unknown-system")
+        error_code = state.get("error_code") or scn.get("error_code", "NO_ERROR_CODE")
+        category = scn.get("category", "Agent P ticket")
+        risk = scn.get("risk", "Medium")
+        priority = scn.get("priority", "P3")
+        route = scn.get("route", "IT Operations")
+        impact = scn.get("impact", "single_user")
+        requester = state.get("user_email") or "demo.user@demo.local"
+        trace = state.get("trace_id") or ""
+        summary = f"{user_text} / {system} / {error_code} / trace {trace}"
+
+        # Generate a KW-#### ticket id matching the TypeScript algorithm.
+        def make_ticket_id(seed: str) -> str:
+            h = 0
+            for ch in seed:
+                h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+            return f"KW-{(h % 9000) + 1000:04d}"
+        ticket_id = make_ticket_id(f"{summary}:{route}")
+
+        # Optional: pull a few KB evidence lines via ripgrep.
+        evidence: list[dict[str, Any]] = []
+        try:
+            kb_root = _Path(__file__).resolve().parents[1] / "knowledge"
+            if kb_root.exists():
+                query = error_code or system
+                if query:
+                    rg = subprocess.run(
+                        ["rg", "-n", "-i", "--max-count", "5", query, str(kb_root)],
+                        capture_output=True, text=True, timeout=4,
+                    )
+                    for line in (rg.stdout or "").splitlines()[:5]:
+                        m = re.match(r"^(.+?):(\d+):(.*)$", line)
+                        if m:
+                            evidence.append({
+                                "path": m.group(1),
+                                "line": int(m.group(2)),
+                                "snippet": m.group(3)[:200],
+                            })
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        ticket = {
+            "ticket_id": ticket_id,
+            "status": "New",
+            "requester": requester,
+            "system": system,
+            "error_code": error_code,
+            "category": category,
+            "risk": risk,
+            "priority": priority,
+            "route": route,
+            "impact": impact,
+            "summary": summary,
+            "evidence": evidence,
+            "evidence_summary": "current ERP error and local KB evidence",
+            "blocked_actions": scn.get("blocked_actions", []),
+        }
+
+        # Friendly Japanese reply. Quote the real ticket id so the user can
+        # see it in the chat and in the IT Operations view.
+        reply = (
+            f"**IT チケットを作成しました**\n\n"
+            f"- **チケットID:** `{ticket_id}`\n"
+            f"- **担当:** {route}\n"
+            f"- **優先度:** {priority} · リスク: {risk}\n"
+            f"- **影響範囲:** {impact}\n"
+            f"- **システム:** {system}\n"
+            f"- **エラーコード:** {error_code}\n"
+            f"- **依頼者:** {requester}\n"
+            f"- **参照トレースID:** {trace or 'なし'}\n\n"
+            f"エビデンス {len(evidence)} 件を添付しました。\n"
+            f"左メニューの **IT Operations** から進捗を確認できます。"
+        )
+        return PiAgentResult(
+            reply=reply,
+            ticket=ticket,
+            evidence=evidence,
+            events=[PiAgentEvent("erp_create_ticket_from_current_error", "ok", json.dumps(ticket, ensure_ascii=False)[:240])],
+        )
+
+    def _load_scenarios(self) -> dict[str, dict[str, Any]]:
+        """Lazy-load the SCENARIOS dict from app.py so we don't duplicate it."""
+        if getattr(self, "_scenarios", None) is None:
+            try:
+                import importlib
+                app_mod = importlib.import_module("app")
+                self._scenarios = getattr(app_mod, "SCENARIOS", {})
+            except Exception:
+                self._scenarios = {}
+        return self._scenarios
