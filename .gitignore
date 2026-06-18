@@ -24,3 +24,9 @@ erp_state/*.tmp
 # OS/editor files
 .DS_Store
 Thumbs.db
+
+# Test artifacts (reproduced by pytest runs / manual screenshots)
+tests/screenshots/
+
+# Runtime state written by app + tests; wiped by clean_state fixture
+erp_state/*.json
