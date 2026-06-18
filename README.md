@@ -88,12 +88,6 @@ make test-ui      #  6 tests, ~2min  (要 Streamlit)
 make test-all     # 95 tests + HTML レポート
 ```
 
-## 制限
-
-- 1.2B モデルは時々不正確 → コード層ガード(followup / re-prompt / 真 ticket 生成)で補完
-- 高リスク操作(MFA 無効化、ライセンス付与、Conditional Access 変更)は**意図的にブロック**
-- すべてシミュレーション — 実 ERP には接続しない
-
 ## ライセンス
 
 MIT
