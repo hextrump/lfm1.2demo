@@ -150,3 +150,13 @@ def browser():
 import sys
 
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Pytest markers ──────────────────────────────────────────────────────
+# Registered here (no pyproject.toml in the repo) so `pytest -m "not slow"`
+# works without a "unknown marker" warning.
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: integration tests requiring llama-server (:8080) and Streamlit (:8501)",
+    )
