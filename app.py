@@ -1671,78 +1671,138 @@ Timestamp: {active_error['timestamp']}
 elif menu == "IT Operations":
     st.title("IT Operations Console")
     st.caption("Agent P から引き継がれた社内サポートチケット")
-    if st.session_state.tickets:
-        df = pd.DataFrame(st.session_state.tickets)
-        for column, default in {
-            "status": "New",
-            "requester": "",
-            "system": "",
-            "category": "",
-            "priority": "",
-            "impact": "",
-            "route": "",
-        }.items():
-            if column not in df.columns:
-                df[column] = default
-        left_it, right_it = st.columns([1.2, 1.0], gap="large")
-        with left_it:
+    left_it, right_it = st.columns([1.2, 1.0], gap="large")
+
+    # ── LEFT COLUMN: ticket table + selectbox + selected-ticket details ──
+    with left_it:
+        if st.session_state.tickets:
+            df = pd.DataFrame(st.session_state.tickets)
+            for column, default in {
+                "status": "New",
+                "requester": "",
+                "system": "",
+                "category": "",
+                "priority": "",
+                "impact": "",
+                "route": "",
+            }.items():
+                if column not in df.columns:
+                    df[column] = default
             st.dataframe(
                 df[["ticket_id", "status", "requester", "system", "priority", "route"]],
                 use_container_width=True,
                 hide_index=True,
             )
-            selected_id = st.selectbox("Open ticket", [t["ticket_id"] for t in st.session_state.tickets], label_visibility="collapsed")
-        ticket = next(t for t in st.session_state.tickets if t["ticket_id"] == selected_id)
-        with right_it:
-            st.markdown(f"#### {ticket.get('ticket_id')} · {ticket.get('title', ticket.get('system', ''))}")
-            st.markdown(
-                f"""
-**Status**: {ticket.get('status', 'New')}  
-**Requester**: {ticket.get('requester', '')}  
-**System**: {ticket.get('system', '')}  
-**Category**: {ticket.get('category', '')}  
-**Priority**: {ticket.get('priority', '')}  
-**Route**: {ticket.get('route', '')}  
-**Impact**: {ticket.get('impact', '')}  
+            selected_id = st.selectbox(
+                "Open ticket",
+                [t["ticket_id"] for t in st.session_state.tickets],
+                label_visibility="collapsed",
+            )
+            # Selected-ticket details, in a bordered container (matches
+            # the Employee Portal "Agent P" card style).
+            ticket = next(t for t in st.session_state.tickets if t["ticket_id"] == selected_id)
+            with st.container(border=True):
+                st.markdown(
+                    f"**{ticket.get('ticket_id', '')} · "
+                    f"{ticket.get('title', ticket.get('system', ''))}**"
+                )
+                st.markdown(
+                    f"""
+**Status**: {ticket.get('status', 'New')}
+**Requester**: {ticket.get('requester', '')}
+**System**: {ticket.get('system', '')}
+**Category**: {ticket.get('category', '')}
+**Priority**: {ticket.get('priority', '')}
+**Route**: {ticket.get('route', '')}
+**Impact**: {ticket.get('impact', '')}
 **Trace ID**: {ticket.get('trace_id', '')}
 """
+                )
+                st.markdown("**Summary**")
+                st.caption(ticket.get("summary", ""))
+                evidence = ticket.get("evidence") or []
+                if evidence:
+                    st.markdown("**Evidence**")
+                    for hit in evidence[:5]:
+                        if hit.get("path") and hit.get("line"):
+                            st.caption(f"{hit['path']}:{hit['line']} - {hit.get('snippet', '')}")
+                        elif hit.get("raw"):
+                            st.caption(str(hit["raw"]))
+                blocked = ticket.get("blocked_actions") or []
+                if blocked:
+                    st.markdown("**Blocked actions**")
+                    st.write(", ".join(blocked))
+        else:
+            st.info("No tickets yet. Create one from Employee Portal.")
+    # ── RIGHT COLUMN: IT Agent P card (mirrors Employee Portal's Agent P) ──
+    with right_it:
+        # Initialize IT agent runtime + chat history
+        if "it_chat_messages" not in st.session_state:
+            st.session_state.it_chat_messages = []
+        if "it_agent_runtime" not in st.session_state:
+            from runtime.pi_agent import PiAgentRuntime, PI_IT_SKILL
+            st.session_state.it_agent_runtime = PiAgentRuntime(skill_path=PI_IT_SKILL)
+        # Agent card (header + status) — matches Employee Portal's
+        # "Agent P" + "Support session" + "Local LFM · Ready" pattern.
+        active_count = sum(
+            1 for t in st.session_state.tickets
+            if t.get("status") in ("New", "Triaged", "In Progress")
+        )
+        st.markdown(
+            f"""
+<div class="assistant-hero">
+  <div>
+    <div class="assistant-name">IT Operations Agent P</div>
+    <div class="assistant-sub">Internal support desk</div>
+  </div>
+</div>
+<div class="assistant-status">
+  <span class="dot dot-live"></span> Local LFM · <b>{active_count} 件のアクティブチケット</b>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        # Bordered card containing chat history + live tail + input
+        with st.container(border=True):
+            st.caption("リスト / 参照 / トリアージ / 解決 / 关闭 / 重新分派 / 评论 を直接実行できます。")
+            # Live Tail SSE console (same component as Employee Portal)
+            if st.session_state.get("live_tail_enabled", True):
+                sse_url = os.environ.get(
+                    "LIVE_TAIL_SSE_URL",
+                    "http://127.0.0.1:8765/sse?log=/tmp/demo1_live_tail.log",
+                )
+                try:
+                    render_live_tail_console(sse_url, height_px=160, max_lines=8)
+                except Exception as exc:
+                    st.caption(f"⚠ live tail unavailable: {exc}")
+            # Chat history
+            for msg in st.session_state.it_chat_messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+            # Chat input — inside the card so the visual unit is one box
+            it_prompt = st.chat_input(
+                "Message IT Agent P (e.g. '未対応チケット一覧', 'KW-1234 を解決')",
+                key="it_chat_input",
             )
-            st.markdown("**Summary**")
-            st.caption(ticket.get("summary", ""))
-            evidence = ticket.get("evidence") or []
-            if evidence:
-                st.markdown("**Evidence**")
-                for hit in evidence[:5]:
-                    if hit.get("path") and hit.get("line"):
-                        st.caption(f"{hit['path']}:{hit['line']} - {hit.get('snippet', '')}")
-                    elif hit.get("raw"):
-                        st.caption(str(hit["raw"]))
-            blocked = ticket.get("blocked_actions") or []
-            if blocked:
-                st.markdown("**Blocked actions**")
-                st.write(", ".join(blocked))
-    else:
-        st.info("No tickets yet. Create one from Employee Portal.")
-    if st.session_state.it_messages:
-        st.markdown("### Agent handoff")
-        st.markdown(st.session_state.it_messages[-1]["content"], unsafe_allow_html=True)
-
-    # ── IT Agent (P) chat box ────────────────────────────────────────────
-    st.divider()
-    st.markdown("### IT Operations Agent P")
-    st.caption("リスト / 参照 / トリアージ / 解決 / 关闭 / 重新分派 / 评论 を直接実行できます。")
-    # Initialize IT chat state
-    if "it_chat_messages" not in st.session_state:
-        st.session_state.it_chat_messages = []
-    if "it_agent_runtime" not in st.session_state:
-        from runtime.pi_agent import PiAgentRuntime, PI_IT_SKILL
-        st.session_state.it_agent_runtime = PiAgentRuntime(skill_path=PI_IT_SKILL)
-    # Display chat history
-    for msg in st.session_state.it_chat_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-    # Chat input
-    it_prompt = st.chat_input("Message IT Agent P (e.g. '未対応チケット一覧', 'KW-1234 を解決')", key="it_chat_input")
+            if it_prompt and it_prompt.strip():
+                st.session_state.it_chat_messages.append(
+                    {"role": "user", "content": it_prompt.strip()}
+                )
+                with st.chat_message("user"):
+                    st.markdown(it_prompt.strip())
+                with st.chat_message("assistant"):
+                    with st.spinner("IT Agent が考え中..."):
+                        reply = st.session_state.it_agent_runtime.chat_it(it_prompt.strip())
+                    st.markdown(reply.reply)
+                st.session_state.it_chat_messages.append(
+                    {"role": "assistant", "content": reply.reply}
+                )
+                if any(
+                    ev.tool.startswith("erp_it_") and ev.status == "ok"
+                    for ev in reply.events
+                ):
+                    load_persisted_tickets()
+                st.rerun()
     if it_prompt and it_prompt.strip():
         st.session_state.it_chat_messages.append({"role": "user", "content": it_prompt.strip()})
         # Display user message
