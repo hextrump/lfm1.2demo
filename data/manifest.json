@@ -1,0 +1,62 @@
+{
+  "schema_version": "v1",
+  "built_at": "2026-06-18T22:41:54",
+  "sft": {
+    "total_rows": 311,
+    "sources": [
+      {
+        "path": "data/seed/agent_p_sft.jsonl",
+        "in_rows": 33,
+        "out_rows": 30,
+        "sha256": "be086023bdd2285953b271ce57551aec45a414fa05e58cff3a63ecb44725aea6"
+      },
+      {
+        "path": "data/_kb_sft.jsonl",
+        "in_rows": 11,
+        "out_rows": 11,
+        "sha256": "b67b6b34290745e3cb469cadf34312e4777f040cf4830eda2197c1f3a6c66f62"
+      },
+      {
+        "path": "data/_scenarios_sft.jsonl",
+        "in_rows": 52,
+        "out_rows": 52,
+        "sha256": "e7e89679b4f3ba1c8e46719071556c1161afe090cee17e0704042304dec56041"
+      },
+      {
+        "path": "data/_sessions_sft.jsonl",
+        "in_rows": 166,
+        "out_rows": 165,
+        "sha256": "56b999c79ced8fb002fce7380b05bc5c1cc54df6d4ebcd7b8959316e7ae07737"
+      },
+      {
+        "path": "data/_tests_sft.jsonl",
+        "in_rows": 66,
+        "out_rows": 53,
+        "sha256": "d59db9a94a268eb67d384427161aeef38026b88e9bc44ec595fa8a376681d78f"
+      }
+    ]
+  },
+  "dpo": {
+    "total_rows": 186,
+    "sources": [
+      {
+        "path": "data/_scenarios_dpo.jsonl",
+        "in_rows": 52,
+        "out_rows": 45,
+        "sha256": "1cc04c698fcdb9861a74f75fdd85afb1cd3ff4e7805fd0cefc9b113c9ee76420"
+      },
+      {
+        "path": "data/_sessions_dpo.jsonl",
+        "in_rows": 105,
+        "out_rows": 70,
+        "sha256": "36b1e2595a210b1246665cf37db09aa3031e1215f177ae16482a7553d2da4dad"
+      },
+      {
+        "path": "data/seed/agent_p_dpo.jsonl",
+        "in_rows": 76,
+        "out_rows": 71,
+        "sha256": "afb5837a575e92b1a8282416f46373de88f1a0509005cc93489e11259afe60bf"
+      }
+    ]
+  }
+}

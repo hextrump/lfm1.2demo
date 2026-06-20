@@ -19,7 +19,7 @@ PI_ERP_SKILL = APP_DIR / ".pi" / "skills" / "erp-support"
 PI_IT_SKILL = APP_DIR / ".pi" / "skills" / "it-support"
 PI_PROVIDER = "local-lfm"
 PI_MODEL = "lfm2-1.2b-tool-q4_k_m.gguf"
-PI_TIMEOUT_SECONDS = 90
+PI_TIMEOUT_SECONDS = 180   # 1.2B + QLoRA slow on some prompts; 3 min ceiling
 PI_TOOL_RETRY_LIMIT = 2
 
 BUILTIN_TOOL_INTENT_PATTERNS = [
@@ -79,12 +79,12 @@ ERP_TICKET_TOOLS = [
 ]
 
 IT_TOOLS = [
-    "erp_it_list_tickets",
+    # Read-only ticket lookup (lets the agent reference a ticket by id).
     "erp_it_get_ticket",
-    "erp_it_triage_ticket",
-    "erp_it_resolve_ticket",
-    "erp_it_close_ticket",
-    "erp_it_reassign_ticket",
+    "kb_rg_search",
+    "kb_read_knowledge",
+    # The only write the IT agent is allowed: a "[Agent P 分析]"
+    # comment. The UI action buttons handle resolve/close/reassign/triage.
     "erp_it_add_comment",
 ]
 
@@ -221,23 +221,45 @@ class PiAgentRuntime:
         return last
 
     def chat_it(self, user_text: str) -> PiAgentResult:
-        """Run the IT Operations Agent P. Uses the it-support skill and
-        restricts tools to erp_it_*. The model is given a different system
-        prompt that tells it to ACT on tickets, not analyze them.
+        """Run the IT Operations Agent P in KB-ANALYST mode.
+
+        Flow:
+          1. Short-circuit on ticket-mutating intent
+             (resolve/close/reassign/triage) — redirect to UI buttons.
+          2. Detect analysis intent ("why", "原因", etc.) and pre-run
+             kb_rg_search in Python, returning citations + suggested
+             next steps directly (the 1.2B model can't reliably emit
+             `<tool_call>kb_rg_search</tool_call>` envelopes).
+          3. If the user pastes a ticket id, look it up via
+             erp_it_get_ticket and include the structured data in
+             the system prompt.
+          4. Otherwise fall through to the LLM with the KB-context
+             prepended to the system prompt.
         """
         if not self.available():
             return PiAgentResult(
                 reply="IT Agent P is not available.",
                 events=[PiAgentEvent("it_agent", "error", "missing CLI, config, extension, or skill")],
             )
-        # Code-level short-circuit: when the user clearly wants to take
-        # an action (resolve/close/reassign/triage/comment), bypass the
-        # 1.2B model and call the Python mutator directly. The model
-        # hallucinates ticket IDs and resolution notes — same problem we
-        # solved with _create_ticket_directly() on the Employee side.
+        # 1. UI-action redirect short-circuit
         direct = self._direct_it_action(user_text)
         if direct is not None:
             return direct
+        # 1b. Greeting / identity / date short-circuit (same logic as
+        # the Employee Portal's _direct_basic_reply; the 1.2B model
+        # hallucinates shell commands for these otherwise).
+        basic = self._direct_basic_reply(user_text)
+        if basic is not None:
+            return PiAgentResult(reply=basic)
+        # 2. KB analysis short-circuit: detect intent, do the search
+        # in Python, synthesize a structured Japanese response with
+        # citations. The 1.2B model is too weak to reliably emit
+        # tool_call envelopes for kb_rg_search; the seed SFT data
+        # had only 11 KB-citation rows vs 311 total.
+        analysis = self._direct_it_kb_analysis(user_text)
+        if analysis is not None:
+            return analysis
+        # 3. Fall through to the LLM with KB context appended
         env = os.environ.copy()
         env.update({
             "PI_CODING_AGENT_DIR": str(self.pi_agent_dir),
@@ -245,38 +267,337 @@ class PiAgentRuntime:
             "PI_SKIP_VERSION_CHECK": "1",
         })
         today = datetime.now().strftime("%Y-%m-%d %A")
+        # 3a. If the user pasted a ticket id, attach the structured
+        # ticket data so the model can ground its answer.
+        sys_prompt = self._it_system_prompt(today)
+        ticket_id = self._extract_it_ticket_id(user_text)
+        ticket_ctx = ""
+        if ticket_id:
+            ticket_ctx = self._fetch_ticket_context(ticket_id)
+        # 3b. If the user mentioned an error code, pre-run kb_rg_search
+        # so the model can quote real citations rather than hallucinate.
+        kb_ctx = self._fetch_kb_context_for_text(user_text)
+        full_prompt = sys_prompt
+        if ticket_ctx:
+            full_prompt += "\n\n" + ticket_ctx
+        if kb_ctx:
+            full_prompt += "\n\n" + kb_ctx
         result = self._run_pi(
             user_text,
             "erp_it",
             today,
             env,
             skill_path=PI_IT_SKILL,
-            system_prompt=self._it_system_prompt(today),
+            system_prompt=full_prompt,
         )
         return result
 
+    def _direct_it_kb_analysis(self, user_text: str) -> "PiAgentResult | None":
+        """If the user asks an analysis question (cause, why, 原因,
+        考えられる), pre-run kb_rg_search in Python and synthesize
+        the answer. Returns None if the user didn't ask an analysis
+        question (caller falls through to the LLM).
+
+        Always returns a structured response (never None) when an
+        analysis intent is detected — even on 0 hits, we return a
+        clear Japanese "no KB match" message rather than letting the
+        LLM hallucinate tool calls.
+        """
+        triggers = (
+            "原因", "なぜ", "why", "what causes", "考えられる",
+            "理由は", "原因は何", "原因を教", "教えて", "explain",
+            "analyze", "分析", "ヘルプ", "help", "調べ",
+        )
+        if not any(t in user_text.lower() for t in triggers):
+            return None
+        # Query resolution order (each step's "winner" becomes the
+        # kb_rg_search query string):
+        #   1. Error code in user text (AADSTS50076 etc.)
+        #   2. Japanese symptom keyword (ログイン, MFA, license, ...)
+        #   3. Ticket id (KW-####) in user text → look up the ticket's
+        #      error_code from erp_state/tickets.json. This handles
+        #      "KW-5511 の原因を調べて" where the operator only
+        #      knows the ticket number.
+        #   4. Fallback: first 60 chars of user text.
+        m = re.search(r"\b(AADSTS\d{4,6}|PBI_[A-Z_]+|LICENSE_MISSING|CA_BLOCK|NO_ERROR_CODE|MULTI_USER_OUTAGE|VENDOR_MFA_EXCEPTION)\b", user_text)
+        if m:
+            query = m.group(1)
+        else:
+            symptom_match = None
+            for kw, code in (
+                ("mfa", "AADSTS50076"), ("サインイン", "AADSTS50076"),
+                ("ログイン", "AADSTS50076"), ("license", "LICENSE_MISSING"),
+                ("power bi", "PBI_ACCESS_DENIED"), ("conditional", "CA_BLOCK"),
+            ):
+                if kw in user_text.lower():
+                    symptom_match = code
+                    break
+            if symptom_match:
+                query = symptom_match
+            else:
+                ticket_id = self._extract_it_ticket_id(user_text)
+                if ticket_id:
+                    ticket_code = self._ticket_error_code(ticket_id)
+                    if ticket_code:
+                        # Ticket found with a real error code — go through
+                        # the normal KB path (caller will handle 0 hits
+                        # below by falling back to a "best guess" based
+                        # on the ticket's system/route).
+                        query = ticket_code
+                    else:
+                        return PiAgentResult(
+                            reply=(
+                                f"**{ticket_id}** は erp_state/tickets.json に見つかりません。\n\n"
+                                "**推奨対応:**\n"
+                                "- チケット ID を確認 (typo ではないか)\n"
+                                "- 該当チケットを先に Employee Portal から作成\n"
+                                "- それでも解決しなければ IT 部門にエスカレーション\n\n"
+                                "**注**: ステータスの変更はチケット詳細カードのボタンから"
+                                "おこなってください。このチャットは分析専用です。"
+                            ),
+                            events=[PiAgentEvent("it_kb_analysis", "ticket_not_found", ticket_id)],
+                        )
+                else:
+                    query = user_text[:60].strip() or "AADSTS50076"
+        hits = self._kb_rg_search(query)
+        if not hits:
+            # No KB match — fall back to a "best guess" that surfaces
+            # the ticket context (if any) and a system-level search.
+            # This is the common case for tickets whose error code
+            # isn't in the local KB but whose system (Dynamics 365,
+            # Power BI, etc.) IS in the KB.
+            return self._it_kb_best_guess(query, user_text)
+        # Synthesize the structured Japanese response
+        parts = [f"**{query}** について、社内 KB を参照した分析結果です。\n"]
+        parts.append("**考えられる原因 (上位):**\n")
+        for h in hits[:4]:
+            path = h.get("path", "")
+            snippet = (h.get("snippet", "") or "")[:140].replace("\n", " ")
+            short = path.split("/")[-1] if path else "?"
+            if snippet:
+                parts.append(f"- **{short}** を参照 — {snippet}…")
+            else:
+                parts.append(f"- **{short}** を参照")
+        parts.append("\n**推奨される次の確認手順:**\n")
+        parts.append("- チケット詳細で Trace ID / Correlation ID を確認")
+        parts.append("- 再現手順をオペレーター本人に確認 (時間帯・ブラウザ・端末)")
+        parts.append("- 上記 KB 該当ルールの self_service 項目を参照")
+        parts.append(
+            "\n**注**: ステータスの変更 (解決 / クローズ / 再分派 / トリアージ) は "
+            "チケット詳細カードのボタンからおこなってください。"
+            "このチャットは分析専用です。"
+        )
+        reply = "\n".join(parts)
+        return PiAgentResult(
+            reply=reply,
+            events=[PiAgentEvent("it_kb_analysis", "ok", f"query={query}; hits={len(hits)}")],
+        )
+
+    def _it_kb_best_guess(
+        self, primary_query: str, user_text: str,
+    ) -> "PiAgentResult":
+        """When the primary KB search (typically an error code) returns
+        no hits, surface a 'best guess' that combines:
+          1. The ticket's known state (if a KW-#### was in the text)
+          2. A broader search by system name (Dynamics 365, Power BI, …)
+          3. The routing matrix hint
+
+        The 1.2B model isn't trusted to synthesize this — we do it in
+        Python so the operator always gets a useful, grounded answer.
+        """
+        import json
+        from pathlib import Path
+        # 1. Pull ticket context (if any)
+        ticket_id = self._extract_it_ticket_id(user_text)
+        ticket_ctx = ""
+        ticket_system = ""
+        if ticket_id:
+            ticket_ctx = self._fetch_ticket_context(ticket_id)
+            # Look up system for the secondary search
+            tickets_path = Path(__file__).resolve().parents[1] / "erp_state" / "tickets.json"
+            if tickets_path.exists():
+                try:
+                    data = json.loads(tickets_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    data = {}
+                for t in data.get("tickets", []):
+                    if t.get("ticket_id") == ticket_id:
+                        ticket_system = (t.get("system") or "").strip()
+                        break
+        # 2. Broader search by system
+        system_hits: list[dict] = []
+        if ticket_system:
+            system_hits = self._kb_rg_search(ticket_system)[:3]
+        parts: list[str] = [
+            f"**{primary_query}** について社内 KB を直接検索しましたが、"
+            f"該当の規程は見つかりませんでした。\n"
+        ]
+        if ticket_ctx:
+            parts.append(ticket_ctx + "\n")
+        if system_hits:
+            parts.append("**システムレベルでの参考情報 (KB):**\n")
+            for h in system_hits:
+                path = h.get("path", "")
+                snippet = (h.get("snippet", "") or "")[:140].replace("\n", " ")
+                short = path.split("/")[-1] if path else "?"
+                if snippet:
+                    parts.append(f"- **{short}** を参照 — {snippet}…")
+                else:
+                    parts.append(f"- **{short}** を参照")
+            parts.append("")
+        parts.append("**考えられる原因 (ベストエフォート):**\n")
+        # Map ticket's system → general troubleshooting axes
+        sys_lower = ticket_system.lower() if ticket_system else ""
+        axes: list[str] = []
+        if "dynamics" in sys_lower or "crm" in sys_lower or "salesforce" in sys_lower:
+            axes = [
+                "認証情報 (SSO / MFA) — 該当ユーザーの Entra ID 状態",
+                "ロール / Business Unit 権限 — セキュリティロール割り当て",
+                "ライセンス — Dynamics 365 / Microsoft 365 の利用開始申請",
+            ]
+        elif "power bi" in sys_lower or "pbi" in sys_lower:
+            axes = [
+                "ワークスペース / レポート / データセットの権限",
+                "ゲートウェイ接続 (オンプレ ソースの場合)",
+                "行レベル セキュリティ (RLS) の該当ユーザー設定",
+            ]
+        elif "sso" in sys_lower or "entra" in sys_lower or "aad" in sys_lower:
+            axes = [
+                "MFA 状態 (Authenticator アプリ登録済みか)",
+                "条件付きアクセス ポリシー適用 (会社支給端末 / VPN)",
+                "サインインログ (Entra admin center)",
+            ]
+        else:
+            axes = [
+                "再現性 (本人だけか / 部署全員か / 全社か)",
+                "最終正常動作からの変更点 (デプロイ / ポリシー変更)",
+                "Trace ID / Correlation ID からの根本原因切り分け",
+            ]
+        for a in axes:
+            parts.append(f"- {a}")
+        parts.append("\n**推奨される次の確認手順:**\n")
+        parts.append("- ルーティングマトリクス (knowledge/helpdesk/ticket-routing-priority-matrix.md) "
+                     "で該当システムの担当チームを確認")
+        parts.append("- 上記軸についてオペレーター本人に確認")
+        parts.append("- それでも解決しなければ該当チームにエスカレーション")
+        parts.append(
+            "\n**注**: ステータスの変更 (解決 / クローズ / 再分派 / トリアージ) は "
+            "チケット詳細カードのボタンからおこなってください。"
+            "このチャットは分析専用です。"
+        )
+        return PiAgentResult(
+            reply="\n".join(parts),
+            events=[PiAgentEvent(
+                "it_kb_analysis", "best_guess",
+                f"query={primary_query}; system={ticket_system}; "
+                f"system_hits={len(system_hits)}",
+            )],
+        )
+
+    def _ticket_error_code(self, ticket_id: str) -> str | None:
+        """Read erp_state/tickets.json and return the error_code for
+        the given ticket id, or None if not found / no error_code set.
+
+        Used by `_direct_it_kb_analysis` to resolve a KW-#### id in
+        the user text into the actual error code, so the KB search
+        query is meaningful even when the operator doesn't paste
+        the error text.
+        """
+        import json
+        from pathlib import Path
+        tickets_path = Path(__file__).resolve().parents[1] / "erp_state" / "tickets.json"
+        if not tickets_path.exists():
+            return None
+        try:
+            data = json.loads(tickets_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        for t in data.get("tickets", []):
+            if t.get("ticket_id") == ticket_id:
+                code = (t.get("error_code") or "").strip()
+                if code and code.upper() not in {"NO_ERROR_CODE", "NONE", "N/A", ""}:
+                    return code
+                # Ticket exists but no error_code — use system field as fallback
+                system = (t.get("system") or "").strip()
+                return system or None
+        return None
+
+    def _fetch_ticket_context(self, ticket_id: str) -> str:
+        """Read tickets.json and return a short Japanese-formatted
+        summary of the given ticket id, or '' if not found."""
+        import json
+        from pathlib import Path
+        tickets_path = Path(__file__).resolve().parents[1] / "erp_state" / "tickets.json"
+        if not tickets_path.exists():
+            return ""
+        try:
+            data = json.loads(tickets_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        for t in data.get("tickets", []):
+            if t.get("ticket_id") == ticket_id:
+                return (
+                    f"**{ticket_id} の現在の状態 (erp_state/tickets.json より):**\n"
+                    f"- status: {t.get('status', '?')}\n"
+                    f"- system: {t.get('system', '?')}\n"
+                    f"- error_code: {t.get('error_code', '?')}\n"
+                    f"- category: {t.get('category', '?')}\n"
+                    f"- risk: {t.get('risk', '?')} / priority: {t.get('priority', '?')}\n"
+                    f"- route: {t.get('route', '?')}\n"
+                    f"- summary: {t.get('summary', '?')}\n"
+                )
+        return ""
+
+    def _fetch_kb_context_for_text(self, user_text: str) -> str:
+        """If the text contains an error code or a distinctive keyword,
+        pre-run kb_rg_search and return a markdown snippet block the
+        model can quote. Returns '' if nothing matched.
+        """
+        m = re.search(r"\b(AADSTS\d{4,6}|PBI_[A-Z_]+|LICENSE_MISSING|CA_BLOCK|MULTI_USER_OUTAGE|VENDOR_MFA_EXCEPTION)\b", user_text)
+        if not m:
+            return ""
+        query = m.group(1)
+        hits = self._kb_rg_search(query)
+        if not hits:
+            return ""
+        lines = [f"**社内 KB ヒット (query={query}):**"]
+        for h in hits[:3]:
+            path = h.get("path", "")
+            snippet = (h.get("snippet", "") or "")[:160].replace("\n", " ")
+            short = path.split("/")[-1] if path else "?"
+            lines.append(f"- **{short}** (line {h.get('line', '?')}): {snippet}")
+        return "\n".join(lines)
+
     def _it_system_prompt(self, today: str) -> str:
         return (
-            "You are the IT Operations Agent P, working from the IT Operations "
-            "Console. Employees in the company create ERP / CRM / SSO support "
-            "tickets from the Employee Portal; you pick them up, triage, and "
-            "resolve them. "
+            "You are the IT Operations Agent P (KB Analyst mode) working from "
+            "the IT Operations Console. You help the IT operator think through "
+            "open tickets: you search the enterprise knowledge base "
+            "(SSO / MFA / license / Dynamics / Power BI / routing policies) "
+            "and propose all plausible root causes with citations. "
             f"Current local date is {today} in Asia/Tokyo. "
             "LANGUAGE: always respond in Japanese. Keep error codes, product "
             "names, and ticket ids (KW-1234) as-is. "
-            "ACT, don't describe: when the user (an IT operator) asks you to "
-            "list, triage, resolve, close, reassign, or comment on a ticket, "
-            "call the corresponding erp_it_* tool immediately. Do not describe "
-            "what you would do; do it. Show the tool's returned summary in the "
-            "reply so the operator sees the new state. "
-            "Before resolving / closing / reassigning, call erp_it_get_ticket "
-            "first to confirm the current state. "
-            "If a tool returns an error, surface it to the operator verbatim. "
+            "ANALYZE, don't mutate ticket status: when the operator asks "
+            "about a ticket or symptom, call kb_rg_search (and optionally "
+            "kb_read_knowledge or erp_it_get_ticket) and synthesize a "
+            "Japanese answer with candidate causes + KB citations + next "
+            "diagnostic steps. Do NOT call erp_it_resolve_ticket / "
+            "erp_it_close_ticket / erp_it_reassign_ticket / "
+            "erp_it_triage_ticket — those are driven by the UI action "
+            "buttons on the ticket detail card. The only write tool you may "
+            "use is erp_it_add_comment, and only when the operator "
+            "explicitly asks you to leave an analysis note (prefix the "
+            "comment with `[Agent P 分析]`). "
+            "List every plausible cause (3-5) with a KB citation, not just "
+            "one. If the KB has 0 hits, say so verbatim — never invent a "
+            "rule. Ask at most 1-2 short follow-up questions if the "
+            "symptom / system / impact scope is genuinely unclear. "
             "Do not use employee-side tools (erp_get_current_error, "
-            "erp_create_ticket_from_current_error, etc.) — those are for the "
+            "erp_analyze_pasted_error_with_kb, etc.) — those are for the "
             "Employee Portal Agent P only. "
-            "Do not call any tool for greetings or small-talk — answer in "
-            "plain Japanese."
+            "For greetings, identity questions, or date / time queries, "
+            "answer in plain Japanese with no tool call."
         )
 
     def _ensure_followup_questions(self, result: PiAgentResult) -> PiAgentResult:
@@ -309,7 +630,26 @@ class PiAgentRuntime:
             # directly from the user's pasted text so we can still build
             # a structured response.
             error_data = self._extract_error_from_user_text(self._last_user_text or "")
+            # If the message looks like a follow-up answer (dept/role/
+            # impact keywords), pull context from active_error.json.
+            error_data = self._enrich_with_active_error(error_data)
         if not error_data and not result.reply:
+            return result
+        # Follow-up reply path: we have user info (dept/role/impact) and
+        # pulled the active error context. Do a real KB lookup now and
+        # build a recommendation block — DON'T re-ask the same questions.
+        if error_data.get("is_followup_reply"):
+            kb_hits = self._kb_rg_search(
+                error_data.get("error_code")
+                or error_data.get("scenario_key")
+                or error_data.get("system")
+                or ""
+            )
+            evidence.extend(kb_hits)
+            # Acknowledge the user's reply + show what we found in KB.
+            ack = self._build_followup_ack(error_data)
+            rec_block = self._build_recommendations_block(error_data, evidence)
+            result.reply = (result.reply or "").rstrip() + "\n\n" + ack + rec_block
             return result
         # If we have nothing to work with (no error code, no events), just
         # append a generic Japanese followup.
@@ -327,6 +667,86 @@ class PiAgentRuntime:
         block = self._build_response_block(error_data, evidence)
         result.reply = (result.reply or "").rstrip() + "\n\n" + block
         return result
+
+    @staticmethod
+    def _kb_rg_search(query: str) -> list[dict[str, Any]]:
+        """Real ripgrep-based KB lookup. Used by _ensure_followup_questions
+        when the user supplies follow-up answer info — produces real
+        evidence instead of letting the model hallucinate."""
+        if not query:
+            return []
+        try:
+            from pathlib import Path
+            import re as _re
+            import subprocess as _sp
+            kb_root = Path(__file__).resolve().parents[1] / "knowledge"
+            if not kb_root.exists():
+                return []
+            rg = _sp.run(
+                ["rg", "-n", "-i", "--max-count", "5", query, str(kb_root)],
+                capture_output=True, text=True, timeout=4,
+            )
+            hits: list[dict[str, Any]] = []
+            for line in (rg.stdout or "").splitlines()[:5]:
+                m = _re.match(r"^(.+?):(\d+):(.*)$", line)
+                if m:
+                    hits.append({
+                        "path": m.group(1),
+                        "line": int(m.group(2)),
+                        "snippet": m.group(3)[:200],
+                    })
+            return hits
+        except Exception:
+            return []
+
+    @staticmethod
+    def _build_followup_ack(error_data: dict[str, Any]) -> str:
+        """Acknowledge the user's follow-up answer (dept/role/etc.) and
+        show what context we picked up from active_error.json."""
+        name = error_data.get("user_name") or "—"
+        dept = error_data.get("department") or "—"
+        role = error_data.get("role") or "—"
+        system = error_data.get("system") or "ERP"
+        code = error_data.get("error_code") or "不明"
+        return (
+            f"**{name} さん ({dept} / {role}) の情報を受領しました。**\n\n"
+            f"状況: {system} で **{code}** が発生中。\n"
+        )
+
+    @staticmethod
+    def _build_recommendations_block(
+        error_data: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> str:
+        """Build a '推奨される次のステップ' block from real KB evidence and
+        scenario-specific recommendations. Used on followup replies —
+        differs from _build_response_block in that it does NOT include
+        the follow-up question section (we already asked once)."""
+        code = str(error_data.get("error_code") or "").strip() or "不明"
+        system = str(error_data.get("system") or "").strip() or "ERP"
+        symptom = str(error_data.get("symptom") or "").strip()
+        rec_lines: list[str] = []
+        if evidence:
+            for hit in evidence[:2]:
+                path = str(hit.get("path") or "").strip()
+                snippet = str(hit.get("snippet") or "").strip()
+                if not path and not snippet:
+                    continue
+                if path:
+                    short_path = path.split("/")[-1] if "/" in path else path
+                    rec_lines.append(f"- **{short_path}** を参照(社内規程)")
+                if snippet:
+                    snippet = snippet[:120].replace("\n", " ")
+                    rec_lines.append(f"  - {snippet}…")
+        # Scenario-specific recommendations (kept safe)
+        rec_lines.extend(PiAgentRuntime._scenario_recommendations(code, symptom))
+        if rec_lines:
+            return "**推奨される次のステップ:**\n\n" + "\n".join(rec_lines[:4]) + "\n"
+        return (
+            "**推奨される次のステップ:**\n\n"
+            "- 社内 KB に該当する規程が見つかりませんでした。IT Operations "
+            "Agent P に直接お問い合わせください。\n"
+        )
 
     @staticmethod
     def _extract_error_from_user_text(text: str) -> dict[str, Any]:
@@ -365,7 +785,54 @@ class PiAgentRuntime:
         # If the text says "additional authentication" or "MFA", set symptom
         if re.search(r"multi[- ]?factor|additional authentication|MFA", text, re.IGNORECASE):
             data.setdefault("symptom", "login_failed")
+        # Detect "follow-up answer" patterns — when the user is answering
+        # the structured questions (dept/role/impact/timing). If matched,
+        # flag the message so the structured-block builder can pull
+        # context from the active_error instead of asking the same Q's.
+        followup_signals = (
+            r"経理部|営業部|人事部|技術部|情報システム|開発部|marketing|sales|"
+            r"finance|hr|engineering|legal|operations|"
+            r"manager|director|lead|engineer|analyst|"
+            r"自分だけ|部署全員|全体|なし|影響.*範囲|"
+            r"\d+\s*日前|\d+\s*週間前|昨日|今日|先月"
+        )
+        if re.search(followup_signals, text, re.IGNORECASE):
+            data["looks_like_followup_answer"] = True
         return data
+
+    def _enrich_with_active_error(self, error_data: dict[str, Any]) -> dict[str, Any]:
+        """When the user is answering follow-up questions and we can't
+        extract an error_code from the message, pull system/error_code/
+        trace_id from the active_error.json on disk. This is how the
+        chat can produce a real KB-based recommendation instead of
+        asking the same three questions again."""
+        if not error_data.get("looks_like_followup_answer"):
+            return error_data
+        try:
+            import json
+            from pathlib import Path
+            err_path = Path(__file__).resolve().parents[1] / "erp_state" / "current_error.json"
+            if not err_path.exists():
+                return error_data
+            state = json.loads(err_path.read_text(encoding="utf-8"))
+            if not state.get("active"):
+                return error_data
+            # Backfill any missing fields from active_error.
+            for key in ("error_code", "system", "trace_id", "symptom",
+                        "correlation_id", "scenario_key"):
+                if not error_data.get(key) and state.get(key):
+                    error_data[key] = state[key]
+            error_data["user_email"] = state.get("user_email")
+            error_data["user_name"] = state.get("user_name")
+            error_data["department"] = state.get("department")
+            error_data["role"] = state.get("role")
+            error_data["scenario_key"] = state.get("scenario_key")
+            # Mark as a followup reply so the structured-block builder
+            # skips the question block.
+            error_data["is_followup_reply"] = True
+        except (OSError, json.JSONDecodeError):
+            pass
+        return error_data
 
     def _reply_already_structured(self, reply: str) -> bool:
         """Return True if the model already gave a CLEAN Japanese reply
@@ -1127,7 +1594,11 @@ class PiAgentRuntime:
     # directly. Same rationale as _create_ticket_directly on the Employee
     # side: code-level enforcement of state transitions.
 
-    _IT_TICKET_ID_RE = re.compile(r"\bKW-\d{4}\b")
+    # Match KW-#### where #### is exactly 4 digits, not followed by
+    # another digit. The previous pattern used \b which doesn't
+    # transition between ASCII digits and Japanese characters, so
+    # "KW-5511エラーの原因" failed to match.
+    _IT_TICKET_ID_RE = re.compile(r"KW-\d{4}(?!\d)")
 
     def _extract_it_ticket_id(self, user_text: str) -> str | None:
         """Pull a KW-#### ticket id out of the user's chat text, or return
@@ -1178,95 +1649,44 @@ class PiAgentRuntime:
         return self._app_mutators
 
     def _direct_it_action(self, user_text: str) -> PiAgentResult | None:
-        """If user_text expresses an IT action (resolve/close/...), perform
-        it via the Python mutator and return a Japanese reply. Returns
-        None if the message is not an action request — caller falls
-        through to the LLM path."""
+        """If user_text expresses a ticket-mutating intent
+        (resolve/close/reassign/triage), redirect the operator to the
+        UI action buttons instead of executing the mutation from chat.
+
+        Returns None if the message is not an action request (caller
+        falls through to the LLM). Returns a redirect PiAgentResult
+        when the user clearly wants a status mutation — that result
+        is rendered in the IT chat without invoking the model.
+
+        Ticket comments via `erp_it_add_comment` are still permitted
+        from chat (they're informational, not status-mutating); we
+        let those fall through to the LLM path so the model can
+        choose to add a `[Agent P 分析]` note or refuse.
+        """
         action = self._user_wants_it_action(user_text)
         if action is None:
             return None
-        # Determine the target ticket: explicit KW-#### in text first,
-        # else fall back to the currently-selected ticket in session_state.
-        ticket_id = self._extract_it_ticket_id(user_text)
-        if ticket_id is None:
-            try:
-                import streamlit as _st
-                # session_state may be missing keys; use .get with default
-                ticket_id = _st.session_state.get("selected_it_ticket")
-            except Exception:
-                ticket_id = None
-        if ticket_id is None:
-            return PiAgentResult(
-                reply=(
-                    "**IT アクションの実行にはチケットIDが必要です**\n\n"
-                    "チャットで `KW-#### を解決して` のように明示するか、"
-                    "左側のチケット詳細ボックスから対象を選択してください。\n\n"
-                    "アクション: 解決 / クローズ / 再分派 / トリアージ / コメント"
-                ),
-                events=[PiAgentEvent("it_action_shortcut", "missing_ticket_id", user_text)],
-            )
-        # Dispatch to the matching mutator (cached import).
-        try:
-            resolve_t, close_t, reassign_t, triage_t, comment_t = self._get_app_mutators()
-        except Exception as exc:
-            import traceback
-            tb = traceback.format_exc()
-            return PiAgentResult(
-                reply=f"IT アクションを処理できません: {exc}",
-                events=[PiAgentEvent("it_action_shortcut", "error", f"{exc}\n{tb}"[:500])],
-            )
-        if action == "resolve":
-            try:
-                ok, msg, new_t = resolve_t(ticket_id, user_text)
-            except Exception as exc:
-                import traceback
-                return PiAgentResult(
-                    reply=f"resolve failed: {exc}\n\n```\n{traceback.format_exc()}\n```",
-                    events=[PiAgentEvent("it_action_shortcut", "resolve_error", str(exc))],
-                )
-        elif action == "close":
-            try:
-                ok, msg, new_t = close_t(ticket_id)
-            except Exception as exc:
-                import traceback
-                return PiAgentResult(
-                    reply=f"close failed: {exc}\n\n```\n{traceback.format_exc()}\n```",
-                    events=[PiAgentEvent("it_action_shortcut", "close_error", str(exc))],
-                )
-        elif action == "reassign":
-            after = re.sub(
-                r".*?(再分派|再アサイン|担当変更|transfer|reassign|重新分派|引き継ぎ)",
-                "", user_text, flags=re.IGNORECASE,
-            ).strip(" 　→->")
-            ok, msg, new_t = reassign_t(ticket_id, after or "IT Operations")
-        elif action == "triage":
-            ok, msg, new_t = triage_t(ticket_id, notes=user_text)
-        else:  # comment
-            note = re.sub(
-                r"^\s*(コメント|comment|评论|備考)[:：]?\s*",
-                "", user_text, flags=re.IGNORECASE,
-            ).strip()
-            ok, msg, new_t = comment_t(ticket_id, note or user_text)
-        status = new_t.get("status") if new_t else "?"
+        # Comment is the only "soft" action — let the LLM handle it.
+        if action == "comment":
+            return None
         verb_jp = {
             "resolve": "解決",
             "close": "クローズ",
             "reassign": "再分派",
             "triage": "トリアージ",
-            "comment": "コメント",
         }[action]
+        ticket_id = self._extract_it_ticket_id(user_text) or "—"
         reply = (
-            f"**{ticket_id} を {verb_jp}しました**\n\n"
-            f"- **ステータス:** {status}\n"
-            f"- **メッセージ:** {msg}\n"
-        ) if ok else (
-            f"**{ticket_id} の {verb_jp}に失敗しました**\n\n"
-            f"- **エラー:** {msg}\n"
+            f"**{ticket_id} の {verb_jp}はチャットからは実行しません**\n\n"
+            f"IT Operations コンソールのチケット詳細カードの "
+            f"「{verb_jp}」ボタンからおこなってください。\n\n"
+            "代わりに、このチケットについて KB を参照した分析を"
+            "お出しできます。エラーコード、症状、再現手順などを"
+            "お教えいただければ、考えられる原因をリストアップします。"
         )
         return PiAgentResult(
             reply=reply,
-            ticket=new_t,
-            events=[PiAgentEvent(f"erp_it_{action}_ticket", "ok" if ok else "error", msg[:200])],
+            events=[PiAgentEvent("it_action_shortcut", "redirect_to_ui", f"{action}:{ticket_id}")],
         )
 
     def _load_scenarios(self) -> dict[str, dict[str, Any]]:

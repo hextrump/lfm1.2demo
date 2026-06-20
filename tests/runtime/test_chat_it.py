@@ -1,9 +1,14 @@
-"""Runtime tests: IT-side agent actions (list / get / triage / resolve /
-close / reassign / comment).
+"""Runtime tests: IT-side agent in KB-ANALYST mode.
 
-The IT agent uses the it-support skill and a different system prompt.
+The IT agent now uses the it-support skill in "KB analyst" mode:
+  - Permitted tools: kb_rg_search, kb_read_knowledge, erp_it_get_ticket,
+    erp_it_add_comment (with [Agent P 分析] prefix only).
+  - Forbidden: erp_it_resolve_ticket / close / reassign / triage.
+    Those are driven by UI action buttons on the IT Operations console.
+
 We seed tickets into erp_state/tickets.json, then call chat_it() and
-verify the right tools were called.
+verify the right tools were called and the reply shape matches the
+KB-analyst contract.
 
 Skipped automatically if llama-server is not running.
 """
@@ -42,121 +47,110 @@ def _seed_ticket(tid: str = "KW-TEST-001", **overrides) -> dict:
     return base
 
 
-def test_it_lists_tickets(it_agent, llama_url, clean_state):
-    TICKETS_STATE.write_text(
-        json.dumps(
-            {
-                "tickets": [
-                    _seed_ticket("KW-1001"),
-                    _seed_ticket("KW-1002", status="Resolved"),
-                ]
-            },
-            ensure_ascii=False,
-        )
-    )
-    result = it_agent.chat_it("未対応のチケットを一覧")
-    called = any(ev.tool == "erp_it_list_tickets" for ev in result.events)
-    assert called, f"erp_it_list_tickets not called. events={result.events}"
-    # Both tickets should be visible
-    assert "KW-1001" in result.reply or "1001" in result.reply
+# ── forbidden action tools (chat must NOT call these) ───────────────────
 
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "KW-3001 を MFA 再設定で対応したので解決マークして",
+        "KW-4001 を Closed にアーカイブして",
+        "KW-5001 は CRM チームの問題なので CRM Owner に再分派して",
+        "KW-6001 をトリアージして",
+    ],
+)
+def test_it_does_not_mutate_ticket_status_from_chat(
+    it_agent, llama_url, clean_state, user_text,
+):
+    """The IT agent must NEVER call resolve/close/reassign/triage tools
+    from chat. Status mutations are UI-driven only."""
+    TICKETS_STATE.write_text(
+        json.dumps({"tickets": [_seed_ticket("KW-3001")]}, ensure_ascii=False)
+    )
+    result = it_agent.chat_it(user_text)
+    forbidden = {
+        "erp_it_resolve_ticket", "erp_it_close_ticket",
+        "erp_it_reassign_ticket", "erp_it_triage_ticket",
+    }
+    bad = [ev for ev in result.events if ev.tool in forbidden]
+    assert not bad, (
+        f"chat should NOT call status-mutating tools. got: {bad}; "
+        f"reply={result.reply[:200]!r}"
+    )
+    # Status on disk must be unchanged
+    on_disk = json.loads(TICKETS_STATE.read_text())
+    ticket = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-3001")
+    assert ticket["status"] == "New", f"status changed from chat: {ticket}"
+
+
+def test_it_redirect_message_mentions_ui_button(it_agent, llama_url, clean_state):
+    """When the user asks to resolve a ticket, the chat should
+    respond with a clear redirect to the UI action button, in Japanese."""
+    TICKETS_STATE.write_text(
+        json.dumps({"tickets": [_seed_ticket("KW-3001")]}, ensure_ascii=False)
+    )
+    result = it_agent.chat_it("KW-3001 を解決して")
+    # Either the Python short-circuit (it_action_shortcut) or the
+    # model itself should produce a redirect that mentions the
+    # UI button. Both are acceptable.
+    has_button = "ボタン" in result.reply or "コンソール" in result.reply
+    assert has_button, (
+        f"reply doesn't mention the UI action button: {result.reply[:200]!r}"
+    )
+
+
+# ── permitted read tools (chat SHOULD call these when relevant) ────────
 
 def test_it_gets_specific_ticket(it_agent, llama_url, clean_state):
-    """The IT agent must call SOME ticket-lookup tool (get or list) and
-    reference the ticket id in its reply. The 1.2B model sometimes picks
-    list over get — both are acceptable as long as the agent interacted
-    with ticket data."""
+    """For a specific ticket id, the agent should call a ticket-lookup
+    tool (erp_it_get_ticket) so the analysis is grounded in real data."""
     TICKETS_STATE.write_text(
         json.dumps(
-            {"tickets": [_seed_ticket("KW-2001", summary="specific summary marker")]} ,
+            {"tickets": [_seed_ticket("KW-2001", summary="specific summary marker")]},
             ensure_ascii=False,
         )
     )
     result = it_agent.chat_it("KW-2001 の詳細を見せて")
-    # Either erp_it_get_ticket OR erp_it_list_tickets counts as a lookup.
-    called_lookup = any(
-        ev.tool in ("erp_it_get_ticket", "erp_it_list_tickets")
-        for ev in result.events
-    )
-    assert called_lookup, f"no ticket-lookup tool called. events={result.events}"
-    # The ticket id appears in the reply (it's a string the model must echo)
+    called = any(ev.tool == "erp_it_get_ticket" for ev in result.events)
+    assert called, f"erp_it_get_ticket not called. events={result.events}"
     assert "KW-2001" in result.reply, f"reply missing ticket id: {result.reply[:300]!r}"
 
 
-def test_it_resolves_ticket(it_agent, llama_url, clean_state):
+def test_it_searches_kb_on_symptom(it_agent, llama_url, clean_state):
+    """When the user pastes a symptom / error code, the agent should
+    produce a structured Japanese analysis with KB citations.
+
+    In KB-analyst mode, the kb_rg_search is run in Python (not by the
+    LLM) and the result is synthesized by `_direct_it_kb_analysis`.
+    We assert on the `it_kb_analysis` event (which carries the hit
+    count in its detail) and on the reply shape.
+    """
     TICKETS_STATE.write_text(
-        json.dumps({"tickets": [_seed_ticket("KW-3001")]}, ensure_ascii=False)
+        json.dumps({"tickets": [_seed_ticket("KW-1001")]}, ensure_ascii=False)
     )
-    result = it_agent.chat_it(
-        "KW-3001 を MFA 再設定で対応したので解決マークして"
+    result = it_agent.chat_it("AADSTS50076 でログインできない原因を教えて")
+    # KB search happened (via the short-circuit; could also be a
+    # kb_rg_search tool call from the LLM, but in practice the
+    # short-circuit always fires when the error code is in the KB).
+    kb_evidence = any(
+        ev.tool in ("it_kb_analysis", "kb_rg_search")
+        for ev in result.events
     )
-    called = any(ev.tool == "erp_it_resolve_ticket" for ev in result.events)
-    assert called, f"erp_it_resolve_ticket not called. events={result.events}"
-    # Verify the ticket is now Resolved on disk
-    on_disk = json.loads(TICKETS_STATE.read_text())
-    ticket = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-3001")
-    assert ticket["status"] == "Resolved", f"status not updated: {ticket}"
-    assert ticket.get("resolution_note"), f"no resolution_note: {ticket}"
-
-
-def test_it_closes_ticket(it_agent, llama_url, clean_state):
-    """Close ticket test. The 1.2B model sometimes does not call
-    `erp_it_close_ticket` and instead gives a "I can't do that"
-    response. We accept that gracefully — the test is informational
-    about which tools the model picks up, not a hard requirement."""
-    TICKETS_STATE.write_text(
-        json.dumps(
-            {"tickets": [_seed_ticket("KW-4001", status="Resolved")]},
-            ensure_ascii=False,
-        )
+    assert kb_evidence, f"no KB search event. events={result.events}"
+    # Japanese, with a citation
+    assert not it_agent._is_mostly_english(result.reply), (
+        f"reply is mostly English: {result.reply[:200]!r}"
     )
-    result = it_agent.chat_it("KW-4001 を Closed にアーカイブして")
-    called = any(ev.tool == "erp_it_close_ticket" for ev in result.events)
-    if not called:
-        pytest.skip(
-            f"model did not call erp_it_close_ticket (1.2B limitation). "
-            f"events={result.events}, reply={result.reply[:200]!r}"
-        )
-    on_disk = json.loads(TICKETS_STATE.read_text())
-    ticket = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-4001")
-    assert ticket["status"] == "Closed"
-
-
-def test_it_reassigns_ticket(it_agent, llama_url, clean_state):
-    TICKETS_STATE.write_text(
-        json.dumps({"tickets": [_seed_ticket("KW-5001")]}, ensure_ascii=False)
+    assert ".md" in result.reply, (
+        f"reply missing KB citation: {result.reply[:300]!r}"
     )
-    result = it_agent.chat_it(
-        "KW-5001 は CRM チームの問題なので CRM Owner に再分派して"
-    )
-    called = any(ev.tool == "erp_it_reassign_ticket" for ev in result.events)
-    assert called, f"erp_it_reassign_ticket not called. events={result.events}"
-    on_disk = json.loads(TICKETS_STATE.read_text())
-    ticket = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-5001")
-    assert "CRM" in ticket["route"], f"route not changed: {ticket}"
-
-
-def test_it_adds_comment(it_agent, llama_url, clean_state):
-    TICKETS_STATE.write_text(
-        json.dumps({"tickets": [_seed_ticket("KW-6001")]}, ensure_ascii=False)
-    )
-    result = it_agent.chat_it(
-        "KW-6001 にユーザーに MFA アプリ再インストールを案内した旨をコメント"
-    )
-    called = any(ev.tool == "erp_it_add_comment" for ev in result.events)
-    assert called, f"erp_it_add_comment not called. events={result.events}"
-    on_disk = json.loads(TICKETS_STATE.read_text())
-    ticket = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-6001")
-    assert len(ticket.get("comments", [])) > 0
 
 
 def test_it_japanese_always(it_agent, llama_url, clean_state):
-    """IT agent should always reply in Japanese."""
+    """The IT agent should always reply in Japanese."""
     TICKETS_STATE.write_text(
         json.dumps({"tickets": [_seed_ticket("KW-7001")]}, ensure_ascii=False)
     )
     result = it_agent.chat_it("KW-7001 を見せて")
-    # Should be mostly Japanese
     assert not it_agent._is_mostly_english(result.reply), (
         f"reply is mostly English: {result.reply[:200]!r}"
     )

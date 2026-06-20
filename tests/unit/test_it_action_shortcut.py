@@ -1,8 +1,11 @@
-"""Unit tests: PiAgentRuntime IT-side action short-circuits.
+"""Unit tests: PiAgentRuntime IT-side action redirect.
 
-Mirrors test_direct_reply.py — tests the pure-Python interception in
-chat_it() that detects resolve/close/reassign/triage/comment intents and
-calls the Python mutator directly, bypassing the 1.2B model.
+In KB-ANALYST mode, `_direct_it_action` no longer mutates ticket state.
+It detects the operator's intent (resolve/close/reassign/triage) and
+returns a redirect message pointing to the UI action button.
+
+`comment` is the only "soft" intent that falls through (returns None)
+so the LLM can choose to add a `[Agent P 分析]` note.
 """
 from __future__ import annotations
 
@@ -48,13 +51,7 @@ def _seed_ticket(**overrides) -> dict:
     return base
 
 
-def _set_session_tickets(tickets: list[dict]) -> None:
-    import streamlit as st
-    st.session_state["tickets"] = list(tickets)
-
-
-# ── intent detection ────────────────────────────────────────────────────
-
+# ── intent detection still works (unchanged from old behavior) ────────
 
 @pytest.mark.parametrize(
     "text,expected",
@@ -86,8 +83,7 @@ def test_user_wants_it_action(text, expected):
     assert r._user_wants_it_action(text) == expected
 
 
-# ── ticket_id extraction ────────────────────────────────────────────────
-
+# ── ticket_id extraction still works (unchanged) ───────────────────────
 
 @pytest.mark.parametrize(
     "text,expected",
@@ -95,8 +91,8 @@ def test_user_wants_it_action(text, expected):
         ("KW-1234 を解決して", "KW-1234"),
         ("解決して KW-9267", "KW-9267"),
         ("please resolve KW-5042", "KW-5042"),
-        ("KW9999", None),  # missing dash
-        ("KW-12", None),  # too short
+        ("KW9999", None),
+        ("KW-12", None),
         ("解決して", None),
         ("", None),
     ],
@@ -106,102 +102,69 @@ def test_extract_it_ticket_id(text, expected):
     assert r._extract_it_ticket_id(text) == expected
 
 
-# ── full short-circuit flow ────────────────────────────────────────────
+# ── new behavior: status-mutating intents return a redirect ───────────
 
-
-def test_direct_it_action_resolve_with_explicit_ticket_id():
+def test_direct_it_action_resolve_returns_redirect_not_mutation():
     _seed_ticket(ticket_id="KW-9267", status="Triaged")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
     r = _agent()
     result = r._direct_it_action("KW-9267 を解決して")
-
     assert result is not None
-    assert "KW-9267" in result.reply
-    assert "解決" in result.reply
-    # Disk should be updated
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-9267")
-    assert target["status"] == "Resolved"
-    # History shape preserved
-    last = target["history"][-1]
-    assert last["action"] == "resolved"
+    # Should mention the UI button (not perform the mutation)
+    assert "ボタン" in result.reply or "コンソール" in result.reply, (
+        f"reply should redirect to UI, got: {result.reply!r}"
+    )
+    # Event records the redirect
+    assert any(ev.tool == "it_action_shortcut" for ev in result.events)
+    # Disk state UNCHANGED
+    on_disk = json.loads(TICKETS_STATE.read_text())
+    target = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-9267")
+    assert target["status"] == "Triaged", f"status was mutated: {target}"
 
 
-def test_direct_it_action_resolve_uses_selected_ticket_fallback():
-    """If no KW-#### in text, fall back to st.session_state.selected_it_ticket."""
-    _seed_ticket(ticket_id="KW-5042", status="Triaged")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
-    import streamlit as st
-    st.session_state["selected_it_ticket"] = "KW-5042"
-
-    r = _agent()
-    result = r._direct_it_action("解決して")
-
-    assert result is not None
-    assert "KW-5042" in result.reply
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-5042")
-    assert target["status"] == "Resolved"
-
-
-def test_direct_it_action_close():
+def test_direct_it_action_close_returns_redirect():
     _seed_ticket(ticket_id="KW-9267", status="Resolved")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
     r = _agent()
     result = r._direct_it_action("KW-9267 をクローズして")
-
     assert result is not None
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-9267")
-    assert target["status"] == "Closed"
+    assert "ボタン" in result.reply or "コンソール" in result.reply
+    on_disk = json.loads(TICKETS_STATE.read_text())
+    target = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-9267")
+    assert target["status"] == "Resolved", f"status was mutated: {target}"
 
 
-def test_direct_it_action_reassign_extracts_route():
+def test_direct_it_action_reassign_returns_redirect():
     _seed_ticket(ticket_id="KW-9267", status="Triaged")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
     r = _agent()
-    # Verb pattern + new route after it
     result = r._direct_it_action("KW-9267 を 再分派 Network Team")
-
     assert result is not None
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-9267")
-    assert target["route"] == "Network Team"
-    last = target["history"][-1]
-    assert last["action"] == "reassigned"
-    assert last["to"] == "Network Team"
+    assert "ボタン" in result.reply or "コンソール" in result.reply
+    on_disk = json.loads(TICKETS_STATE.read_text())
+    target = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-9267")
+    assert target["route"] == "Identity / Entra ID 管理チーム", (
+        f"route was mutated: {target}"
+    )
 
 
-def test_direct_it_action_triage():
+def test_direct_it_action_triage_returns_redirect():
     _seed_ticket(ticket_id="KW-9267", status="New")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
     r = _agent()
     result = r._direct_it_action("KW-9267 をトリアージして")
-
     assert result is not None
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-9267")
-    assert target["status"] == "Triaged"
+    assert "ボタン" in result.reply or "コンソール" in result.reply
+    on_disk = json.loads(TICKETS_STATE.read_text())
+    target = next(t for t in on_disk["tickets"] if t["ticket_id"] == "KW-9267")
+    assert target["status"] == "New", f"status was mutated: {target}"
 
 
-def test_direct_it_action_comment():
+def test_direct_it_action_comment_falls_through_to_llm():
+    """Comments are informational, not status-mutating. The short-circuit
+    returns None so the LLM can choose to add a [Agent P 分析] note
+    or refuse."""
     _seed_ticket(ticket_id="KW-9267", status="Triaged")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
     r = _agent()
-    result = r._direct_it_action("KW-9267 にコメント: 進捗確認しました")
-
-    assert result is not None
-    disk = json.loads(TICKETS_STATE.read_text())
-    target = next(t for t in disk["tickets"] if t["ticket_id"] == "KW-9267")
-    assert len(target["comments"]) == 1
-    assert "進捗確認" in target["comments"][0]["comment"]
-    assert target["history"][-1]["action"] == "comment"
+    # "comment" is the only verb that returns None
+    assert r._direct_it_action("KW-9267 にコメント: 進捗確認しました") is None
+    assert r._direct_it_action("comment on KW-9267") is None
 
 
 def test_direct_it_action_no_intent_returns_none():
@@ -212,45 +175,19 @@ def test_direct_it_action_no_intent_returns_none():
     assert r._direct_it_action("") is None
 
 
-def test_direct_it_action_no_ticket_id_returns_help_message():
-    """Action verb without any ticket id (and no selected_ticket fallback)
-    returns a clear Japanese help message instead of guessing."""
-    # Make sure session state has no selected ticket
-    import streamlit as st
-    st.session_state.pop("selected_it_ticket", None)
-    st.session_state["tickets"] = []
-
+def test_direct_it_action_redirect_uses_japanese_verb_label():
+    """The redirect message labels the action in Japanese so the
+    operator can find the right UI button."""
+    _seed_ticket(ticket_id="KW-9267")
     r = _agent()
-    result = r._direct_it_action("解決して")
-
-    assert result is not None
-    assert "チケットID" in result.reply
-    assert "KW-####" in result.reply
-
-
-def test_direct_it_action_rejects_close_on_already_closed():
-    """Close on a Closed ticket returns the mutator's error message."""
-    _seed_ticket(ticket_id="KW-9267", status="Closed")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
-    r = _agent()
-    result = r._direct_it_action("KW-9267 をクローズして")
-
-    assert result is not None
-    # The shortcut should NOT pretend success — surface the mutator error
-    assert "失敗" in result.reply or "できません" in result.reply
-
-
-def test_direct_it_action_events_record_correctly():
-    """The PiAgentResult.events list records the action for the audit log."""
-    _seed_ticket(ticket_id="KW-9267", status="Triaged")
-    _set_session_tickets([json.loads(TICKETS_STATE.read_text())["tickets"][0]])
-
-    r = _agent()
-    result = r._direct_it_action("KW-9267 を解決して")
-
-    assert result is not None
-    assert len(result.events) == 1
-    ev = result.events[0]
-    assert ev.tool == "erp_it_resolve_ticket"
-    assert ev.status == "ok"
+    for verb_en, verb_jp in [
+        ("resolve", "解決"),
+        ("close", "クローズ"),
+        ("reassign", "再分派"),
+        ("triage", "トリアージ"),
+    ]:
+        result = r._direct_it_action(f"KW-9267 を{verb_jp}して")
+        assert result is not None
+        assert verb_jp in result.reply, (
+            f"redirect for {verb_en} should mention {verb_jp!r}, got: {result.reply!r}"
+        )

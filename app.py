@@ -2172,7 +2172,7 @@ elif menu == "IT Operations":
         )
         # Bordered card containing chat history + live tail + input
         with st.container(border=True):
-            st.caption("リスト / 参照 / トリアージ / 解決 / 关闭 / 重新分派 / 评论 を直接実行できます。")
+            st.caption("KB を検索して考えられる原因と診断手順を提案します。チケットのステータス変更は左の詳細カードのボタンからおこなってください。")
             # Live Tail SSE console (same component as Employee Portal)
             if st.session_state.get("live_tail_enabled", True):
                 sse_url = os.environ.get(
@@ -2189,7 +2189,7 @@ elif menu == "IT Operations":
                     st.markdown(msg["content"])
             # Chat input — inside the card so the visual unit is one box
             it_prompt = st.chat_input(
-                "Message IT Agent P (e.g. '未対応チケット一覧', 'KW-1234 を解決')",
+                "Message IT Agent P (e.g. 'AADSTS50076 の原因は?', 'KW-1234 を見せて')",
                 key="it_chat_input",
             )
             if it_prompt and it_prompt.strip():
@@ -2255,6 +2255,9 @@ else:
     st.title("Audit Log")
     st.caption("Agent decisions, evidence lookup, ticket handoff and blocked actions.")
     if st.session_state.audit_logs:
-        st.dataframe(pd.DataFrame(st.session_state.audit_logs), use_container_width=True, hide_index=True)
+        # Drop the `risk` column from display — internal field, not useful
+        # to operators reviewing the log.
+        df = pd.DataFrame(st.session_state.audit_logs).drop(columns=["risk"], errors="ignore")
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.info("No audit events yet.")

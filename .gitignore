@@ -30,3 +30,6 @@ tests/screenshots/
 
 # Runtime state written by app + tests; wiped by clean_state fixture
 erp_state/*.json
+
+# Agent P fine-tuning data pipeline — intermediate files (rebuild via `make data`)
+data/_*.jsonl
